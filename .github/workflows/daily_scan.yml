@@ -1,0 +1,48 @@
+name: Matrix 18.1 Daily Scan
+
+on:
+  schedule:
+    - cron: '15 14 * * 1-5'
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pandas numpy requests
+
+      - name: Run Matrix 18.1 scan
+        run: python scan.py
+
+      - name: Save results to repo
+        run: |
+          git config user.name "Matrix 18.1 Bot"
+          git config user.email "bot@matrix181.com"
+          git stash
+          git pull --rebase origin main
+          git stash pop || true
+          git add -f results/matrix181_results.json
+          git diff --staged --quiet || git commit -m "Auto scan $(date +'%Y-%m-%d %H:%M')"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
