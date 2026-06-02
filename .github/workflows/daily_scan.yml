@@ -1,0 +1,103 @@
+name: Matrix 18.1 Daily Scan
+
+on:
+  schedule:
+    - cron: '15 14 * * 1-5'
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pandas numpy requests
+
+      - name: Run Matrix 18.1 scan
+        run: python scan.py
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+
+      - name: Upload results via GitHub API
+        run: |
+          python3 - <<'PYEOF'
+          import base64, json, os, sys, requests
+
+          token = os.environ.get("PAT_TOKEN", "")
+          if not token:
+              print("ERROR: PAT_TOKEN not set")
+              sys.exit(1)
+
+          filepath = "results/matrix181_results.json"
+          if not os.path.exists(filepath):
+              print(f"ERROR: {filepath} not found — scan.py did not create it")
+              sys.exit(1)
+
+          with open(filepath, "r") as f:
+              content = f.read()
+
+          size = len(content)
+          print(f"File size: {size} bytes")
+          if size < 100:
+              print("ERROR: File too small — scan may have failed")
+              sys.exit(1)
+
+          api_url = "https://api.github.com/repos/gauravmsm/matrix181-backend/contents/results/matrix181_results.json"
+          headers = {
+              "Authorization": f"token {token}",
+              "Accept": "application/vnd.github.v3+json",
+              "Content-Type": "application/json",
+          }
+
+          sha = None
+          r = requests.get(api_url, headers=headers, timeout=15)
+          print(f"GET status: {r.status_code}")
+          if r.status_code == 200:
+              sha = r.json().get("sha")
+              print(f"Existing SHA: {sha[:8] if sha else 'none'}")
+          elif r.status_code == 404:
+              print("File does not exist yet — will create fresh")
+          else:
+              print(f"Unexpected GET response: {r.text[:200]}")
+
+          encoded = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+          payload = {
+              "message": "Auto scan results",
+              "content": encoded,
+              "branch":  "main",
+          }
+          if sha:
+              payload["sha"] = sha
+
+          r = requests.put(api_url, headers=headers, json=payload, timeout=60)
+          print(f"PUT status: {r.status_code}")
+
+          if r.status_code in (200, 201):
+              download_url = r.json().get("content", {}).get("download_url", "")
+              print(f"SUCCESS — file saved")
+              print(f"URL: {download_url}")
+          else:
+              print(f"FAILED — {r.status_code}")
+              print(r.text[:500])
+              sys.exit(1)
+          PYEOF
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
