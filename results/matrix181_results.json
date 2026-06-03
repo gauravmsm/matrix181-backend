@@ -1,1 +1,1 @@
-{"stocks": [], "count": 0, "s1Count": 0, "s2Count": 0, "fetchedAt": "2026-06-03T19:13:40.905757", "autoRun": true, "daysOfData": 55, "dataAvailability": {"mcap": true, "delivery": true, "value": true, "sma200": true}}
+{"stocks": [], "count": 0, "s1Count": 0, "s2Count": 0, "fetchedAt": "2026-06-03T19:26:14.613121", "autoRun": true, "daysOfData": 56, "dataAvailability": {"mcap": true, "delivery": true, "deliveryDays": 25, "value": true, "sma200": true, "w52": true}}
