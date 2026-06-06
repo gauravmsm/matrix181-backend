@@ -1,0 +1,28 @@
+name: Daily Delivery Upload
+
+on:
+  schedule:
+    - cron: '0 14 * * 1-5'   # 7:30 PM IST = 14:00 UTC, Mon-Fri
+  workflow_dispatch:           # manual trigger anytime
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests pandas
+
+      - name: Upload today's delivery data
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: python scripts/daily_delivery.py

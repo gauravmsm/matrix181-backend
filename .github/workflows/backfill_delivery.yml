@@ -1,0 +1,37 @@
+name: Backfill Delivery Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Number of trading days to backfill (max 90)'
+        required: false
+        default: '60'
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests pandas
+
+      - name: Backfill delivery CSVs
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          BACKFILL_DAYS: ${{ github.event.inputs.days }}
+        run: python scripts/backfill_delivery.py
+
+      - name: Summary
+        run: |
+          echo "Delivery backfill complete"
+          echo "Files at: https://github.com/gauravmsm/matrix181-backend/tree/main/data/delivery"
