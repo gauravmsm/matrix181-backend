@@ -1,0 +1,3159 @@
+"""
+MATRIX 18.5 — NSE Institutional Accumulation Screener
+======================================================
+Objective: Detect institutional accumulation EARLIER than price moves.
+           Not a momentum/RS/quality screener — a signal detection framework.
+
+Data: BhavCopy ZIP × 260 days + Delivery CSV × 52 days (repo) + SHARES_MAP
+
+S1 Hard: MCap 1500-30K | RSI >40 | Close>30DMA | 30DMA>150DMA | 150DMA Rising
+S2 Hard: MCap >30K     | RSI >40 | Close>20DMA | Close>50DMA
+
+S1: ZERO CHANGES from 18.2 — logic and calibration confirmed correct.
+S2: 7 targeted changes only (S2-only upgrade):
+
+  1. 200DMA Distance Score (replaces old ma×5 binary):
+       0-2%  → 5 pts  (possible re-entry, not confirmed)
+       2-10% → 15 pts (ideal early zone — best R/R)
+      10-20% → 13 pts (healthy institutional trend)
+      20-35% → 11 pts (mature uptrend — historically validated)
+      35-50% →  8 pts (extended but valid)
+       >50%  →  5 pts (momentum territory, not accumulation)
+     Falling 200DMA: cap at 6 pts regardless of distance
+
+  2. S2 Grading — Delivery: two paths to A/A+
+     Path A (acceleration): d20≥52%, d20-d50≥4%
+     Path B (quality):      d20≥58%, d20≥d50-3% (sustained ownership, not declining)
+
+  3. S2 A+ volume: 1.5x → 1.35x  (large caps accumulate at 1.1-1.35x)
+  4. S2 A  volume: 1.35x → 1.20x
+  5. S2 A+ delivery level: 55% → 52% (Path A) / 58% (Path B)
+  6. S2 A  delivery level: 48% → 45%
+  7. S2 A  score threshold: 68 → 65 (your final call)
+     S2 A+ score threshold: 82 UNCHANGED (test after 6-month backtest)
+
+RSI bands: UNCHANGED (RSI = entry timing, not institutional behaviour)
+Delivery trend distinction: PRESERVED (delivery LEVEL vs TREND are different signals)
+"""
+import pandas as pd
+import numpy as np
+import requests, zipfile, io, json, os, base64
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+HDR = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "*/*", "Accept-Encoding": "gzip, deflate",
+    "Referer": "https://www.nseindia.com/",
+}
+S = requests.Session(); S.headers.update(HDR)
+
+PAT   = os.environ.get("PAT_TOKEN","")
+GUSER = "gauravmsm"
+GREPO = "matrix181-backend"
+GPATH = "results/matrix181_results.json"
+
+# ── Parameters ────────────────────────────────────────────────────────────────
+# S1 — Mid/Small Cap (UNCHANGED from 18.2)
+S1_MCAP_MIN  = 1500;   S1_MCAP_MAX  = 30000
+S1_RSI_MIN   = 40.0        # Hard floor only — ceiling in confidence score
+S1_VOL_RATIO = 1.10
+S1_TV_MIN    = 5.0
+S1_LOW_MIN   = 1.05;   S1_LOW_MAX   = 1.45
+S1_H60       = 0.85
+S1_DEL_MIN   = 40.0
+S1_DEL_GAP   = 2.0
+
+# S2 — Large/Mega Cap (18.5 calibrated)
+S2_MCAP_MIN  = 30000
+S2_RSI_MIN   = 40.0        # Hard floor only — ceiling in confidence score
+S2_VOL_RATIO = 1.10        # Soft filter baseline (unchanged)
+S2_TV_MIN    = 25.0
+S2_DEL_MIN   = 40.0
+# S2_HIGH_MIN/MAX removed — replaced by 200DMA Distance Score (18.3+)
+
+# S2 200DMA Distance Score zones (used in dma200_score())
+# Historically validated: HAL(+24%) → +200%, CG Power(+34%) → +627%
+# Scoring deliberately stepped (not flat) to preserve entry quality gradient
+S2_DMA200 = {          # pct_above_200DMA → score
+    "ideal_lo":  2.0,  # 2-10%:  15 pts (best R/R, early institutional re-entry)
+    "ideal_hi": 10.0,
+    "health_hi":20.0,  # 10-20%: 13 pts (healthy institutional trend)
+    "mature_hi":35.0,  # 20-35%: 11 pts (mature uptrend — validated by winners)
+    "extend_hi":50.0,  # 35-50%:  8 pts (extended, valid)
+                       # >50%:    5 pts  (momentum territory, not accumulation)
+}
+
+# S2 Grade thresholds (18.5)
+S2_APLUS_SCORE = 82     # UNCHANGED — test after 6-month backtest
+S2_A_SCORE     = 65     # 18.5: lowered from 68 (your final call)
+S2_APLUS_VOL   = 1.35   # 18.5: from 1.50 (large caps accumulate at 1.1-1.35x)
+S2_A_VOL       = 1.20   # 18.5: from 1.35
+# S2 A+ delivery: Path A (acceleration) OR Path B (sustained quality)
+S2_APLUS_DEL_A = 52.0; S2_APLUS_GAP_A = 4.0   # Path A: acceleration signal
+S2_APLUS_DEL_B = 58.0; S2_APLUS_GAP_B = -3.0  # Path B: quality (not declining)
+S2_A_DEL       = 45.0;  S2_A_GAP      = 1.0   # Grade A thresholds
+
+DAYS_BHAV = 260
+DAYS_FULL =  52   # Read from data/delivery/ in GitHub repo (52 days pre-loaded)
+
+# ── Shares Map (MCap = Close × shares_cr) — from StocksTraded 04-Jun-2026 ──
+SHARES_MAP = {
+    "20MICRONS": 3.5286,
+    "21STCENMGM": 1.0501,
+    "360ONE": 40.6487,
+    "3BBLACKBIO": 0.8583,
+    "3IINFOLTD": 20.7403,
+    "3MINDIA": 1.1265,
+    "3PLAND": 1.8,
+    "5PAISA": 4.6882,
+    "63MOONS": 4.6079,
+    "A2ZINFRA": 17.752,
+    "AAATECH": 1.2827,
+    "AADHARHFC": 43.644,
+    "AARNAV": 4.2238,
+    "AARON": 2.0947,
+    "AARTECH": 3.1771,
+    "AARTIDRUGS": 9.127,
+    "AARTIIND": 36.2594,
+    "AARTIPHARM": 9.0658,
+    "AARTISURF": 0.8465,
+    "AARVI": 1.4843,
+    "AAVAS": 7.9283,
+    "ABB": 21.1908,
+    "ABBOTINDIA": 2.1249,
+    "ABCAPITAL": 262.1571,
+    "ABCOTS": 2.1964,
+    "ABDL": 27.971,
+    "ABFRL": 122.0511,
+    "ABGSEC": 0.1029,
+    "ABINFRA": 63.8792,
+    "ABLBL": 122.0521,
+    "ABMINTLLTD": 0.9409,
+    "ABMKNO": 2.0002,
+    "ABREL": 11.1696,
+    "ABSL10BANK": 1.7007,
+    "ABSLAMC": 28.9175,
+    "ABSLBANETF": 42.9815,
+    "ABSLLIQUID": 0.0343,
+    "ABSLMSCIN": 0.3473,
+    "ABSLNN50ET": 1.3839,
+    "ABSLPSE": 1.9801,
+    "ACC": 18.7787,
+    "ACCELYA": 1.4926,
+    "ACCURACY": 15.056,
+    "ACE": 11.9083,
+    "ACEINTEG": 1.02,
+    "ACI": 12.3458,
+    "ACL": 9.2173,
+    "ACMESOLAR": 60.5972,
+    "ACSTECH": 6.0682,
+    "ACUTAAS": 8.1871,
+    "ADANIENSOL": 120.1283,
+    "ADANIENT": 129.1893,
+    "ADANIGREEN": 164.1394,
+    "ADANIPORTS": 230.3959,
+    "ADANIPOWER": 1928.4695,
+    "ADFFOODS": 10.9864,
+    "ADL": 0.5567,
+    "ADOR": 1.7403,
+    "ADROITINFO": 5.4178,
+    "ADSL": 5.6568,
+    "ADVAIT": 1.0943,
+    "ADVANCE": 6.4286,
+    "ADVANIHOTR": 9.2438,
+    "ADVENTHTL": 5.3943,
+    "ADVENZYMES": 11.1976,
+    "AEGISLOG": 35.1,
+    "AEGISVOPAK": 110.7992,
+    "AEPL": 25.1038,
+    "AEQUS": 67.0666,
+    "AEROENTER": 11.3085,
+    "AEROFLEX": 13.2331,
+    "AERONEU": 2.5796,
+    "AETHER": 13.2709,
+    "AFCONS": 36.7785,
+    "AFFLE": 14.0796,
+    "AFSL": 5.0793,
+    "AGARIND": 1.4958,
+    "AGARWALEYE": 31.6983,
+    "AGI": 6.4697,
+    "AGIIL": 12.4997,
+    "AGRITECH": 0.594,
+    "AGROPHOS": 2.0275,
+    "AHCL": 53.1512,
+    "AHLADA": 1.2922,
+    "AHLEAST": 1.7292,
+    "AHLUCONT": 6.6988,
+    "AIAENG": 9.332,
+    "AIIL": 84.9225,
+    "AIRAN": 12.5018,
+    "AIROLAM": 1.5002,
+    "AJANTPHARM": 12.4936,
+    "AJAXENGG": 11.4407,
+    "AJMERA": 19.6796,
+    "AJOONI": 17.2253,
+    "AKASH": 1.6863,
+    "AKCAPIT": 0.66,
+    "AKG": 3.1775,
+    "AKI": 10.3203,
+    "AKSHAR": 78.7556,
+    "AKSHARCHEM": 0.8033,
+    "AKUMS": 15.7394,
+    "ALANKIT": 27.1154,
+    "ALBERTDAVD": 0.5707,
+    "ALEMBICLTD": 25.6782,
+    "ALGOQUANT": 28.1097,
+    "ALICON": 1.6412,
+    "ALIVUS": 12.2739,
+    "ALKEM": 11.9565,
+    "ALKYLAMINE": 5.1144,
+    "ALLCARGO": 149.7782,
+    "ALLDIGI": 1.5238,
+    "ALLTIME": 6.5508,
+    "ALMONDZ": 17.3648,
+    "ALOKINDS": 496.5243,
+    "ALPA": 2.1041,
+    "ALPHA": 16.2827,
+    "ALPHAETF": 16.0097,
+    "ALPHAGEO": 0.6365,
+    "ALPL30IETF": 56.1814,
+    "AMAGI": 21.6339,
+    "AMANTA": 3.8829,
+    "AMBALALSA": 7.6632,
+    "AMBER": 3.522,
+    "AMBICAAGAR": 1.7177,
+    "AMBIKCO": 0.5725,
+    "AMBUJACEM": 247.1823,
+    "AMDIND": 1.9167,
+    "AMIRCHAND": 10.3552,
+    "AMJLAND": 4.0999,
+    "AMNPLST": 5.502,
+    "AMRUTANJAN": 2.8911,
+    "ANANDRATHI": 8.3021,
+    "ANANTRAJ": 35.9877,
+    "ANDHRAPAP": 19.885,
+    "ANDHRSUGAR": 13.5535,
+    "ANGELONE": 91.1999,
+    "ANMOL": 5.6918,
+    "ANTELOPUS": 3.5162,
+    "ANTGRAPHIC": 15.5062,
+    "ANTHEM": 56.3195,
+    "ANUHPHR": 10.0225,
+    "ANUP": 2.0031,
+    "ANURAS": 11.3848,
+    "AONEGOLD": 5.7641,
+    "AONELIQUID": 0.2819,
+    "AONENIFTY": 2.2705,
+    "AONESILVER": 2.731,
+    "AONETMMQ50": 0.682,
+    "AONETOTAL": 3.6541,
+    "APARINDS": 4.0168,
+    "APCL": 2.9375,
+    "APCOTEXIND": 5.1845,
+    "APEX": 3.125,
+    "APLAPOLLO": 27.7658,
+    "APLLTD": 19.6563,
+    "APOLLO": 35.7292,
+    "APOLLOHOSP": 14.3785,
+    "APOLLOPIPE": 4.4048,
+    "APOLLOTYRE": 63.5101,
+    "APOLSINHOT": 0.26,
+    "APTECHT": 5.8003,
+    "APTUS": 50.0743,
+    "AQYLON": 25.3731,
+    "ARCHIDPLY": 1.9864,
+    "ARCHIES": 3.378,
+    "ARE&M": 18.3025,
+    "ARENTERP": 0.311,
+    "ARFIN": 16.8723,
+    "ARIES": 1.3004,
+    "ARIHANT": 0.9966,
+    "ARIHANTCAP": 10.9612,
+    "ARIHANTSUP": 4.325,
+    "ARIS": 8.1761,
+    "ARKADE": 18.5664,
+    "ARMANFIN": 1.0515,
+    "AROGRANITE": 1.53,
+    "ARROWGREEN": 1.5088,
+    "ARSSBL": 6.3026,
+    "ARTEMISMED": 15.8274,
+    "ARTNIRMAN": 2.4957,
+    "ARVEE": 1.102,
+    "ARVIND": 26.214,
+    "ARVINDFASN": 13.363,
+    "ARVSMART": 4.5867,
+    "ASAHIINDIA": 25.4927,
+    "ASAHISONG": 1.1787,
+    "ASAL": 1.5864,
+    "ASALCBR": 2.0079,
+    "ASHAPURMIN": 9.5526,
+    "ASHIANA": 10.0525,
+    "ASHIKA": 4.4725,
+    "ASHIMASYN": 19.1663,
+    "ASHOKA": 28.0723,
+    "ASHOKAMET": 2.4994,
+    "ASHOKLEY": 587.3855,
+    "ASIANENE": 4.4948,
+    "ASIANHOTNR": 4.2633,
+    "ASIANPAINT": 95.9198,
+    "ASIANTILES": 29.6475,
+    "ASKAUTOLTD": 19.7143,
+    "ASMS": 30.4576,
+    "ASPINWALL": 0.7818,
+    "ASTEC": 2.2282,
+    "ASTERDM": 51.8121,
+    "ASTRAL": 26.865,
+    "ASTRAMICRO": 9.4945,
+    "ASTRAZEN": 2.5,
+    "ATALREAL": 12.3895,
+    "ATAM": 1.1463,
+    "ATGL": 109.981,
+    "ATHERENERG": 38.2982,
+    "ATL": 29.1861,
+    "ATLANTAA": 8.1499,
+    "ATLASCYCLE": 0.6504,
+    "ATUL": 2.9442,
+    "ATULAUTO": 2.7751,
+    "AUBANK": 74.874,
+    "AURIGROW": 147.6129,
+    "AURIONPRO": 5.5262,
+    "AUROPHARMA": 57.5378,
+    "AURUM": 7.6274,
+    "AUTOAXLES": 1.5112,
+    "AUTOBEES": 1.5402,
+    "AUTOIETF": 7.8074,
+    "AVALON": 6.6788,
+    "AVANTEL": 26.5711,
+    "AVANTIFEED": 13.6246,
+    "AVG": 1.5057,
+    "AVL": 12.9138,
+    "AVONMORE": 28.2187,
+    "AVROIND": 13.3107,
+    "AVTNPL": 15.2284,
+    "AWFIS": 7.154,
+    "AWHCL": 2.8382,
+    "AWL": 129.9679,
+    "AXISBANK": 310.9931,
+    "AXISBNKETF": 0.6118,
+    "AXISCADES": 4.2531,
+    "AXISCETF": 0.1155,
+    "AXISGOLD": 42.5007,
+    "AXISHCETF": 0.1555,
+    "AXISILVER": 8.2527,
+    "AXISNIFTY": 4.7922,
+    "AXISTECETF": 0.5416,
+    "AXISVALUE": 1.1129,
+    "AXITA": 38.2554,
+    "AXSENSEX": 1.6021,
+    "AYE": 24.6784,
+    "AYMSYNTEX": 5.8614,
+    "AZAD": 6.4582,
+    "BAFNAPH": 2.3656,
+    "BAGFILMS": 20.7545,
+    "BAIDFIN": 15.4888,
+    "BAJAJ-AUTO": 27.9498,
+    "BAJAJCON": 13.0618,
+    "BAJAJELEC": 11.5391,
+    "BAJAJFINSV": 160.055,
+    "BAJAJHCARE": 3.3663,
+    "BAJAJHFL": 833.2335,
+    "BAJAJHIND": 239.0664,
+    "BAJAJHLDNG": 11.1294,
+    "BAJAJINDEF": 3.2,
+    "BAJAJST": 2.08,
+    "BAJEL": 11.5697,
+    "BAJFINANCE": 622.5614,
+    "BALAJEE": 8.1571,
+    "BALAJITELE": 12.1903,
+    "BALAMINES": 3.2401,
+    "BALKRISHNA": 3.222,
+    "BALKRISIND": 19.3317,
+    "BALMLAWRIE": 17.1004,
+    "BALPHARMA": 1.5921,
+    "BALRAMCHIN": 20.195,
+    "BALUFORGE": 11.7622,
+    "BANARBEADS": 0.6597,
+    "BANARISUG": 1.254,
+    "BANCOINDIA": 14.3037,
+    "BANDHANBNK": 161.1018,
+    "BANG": 1.3561,
+    "BANK10ADD": 15.9151,
+    "BANKADD": 8.0371,
+    "BANKBARODA": 517.1362,
+    "BANKBEES": 14.2099,
+    "BANKBETA": 57.3499,
+    "BANKBETF": 7.0449,
+    "BANKETF": 0.5388,
+    "BANKIETF": 51.0641,
+    "BANKINDIA": 455.2668,
+    "BANKNIFTY1": 76.9694,
+    "BANKPSU": 0.6926,
+    "BANSALWIRE": 15.6556,
+    "BANSWRAS": 3.4232,
+    "BASF": 4.3286,
+    "BASML": 7.9922,
+    "BATAINDIA": 12.8528,
+    "BATLIBOI": 4.7132,
+    "BAYERCROP": 5.0107,
+    "BBETF0432": 7.8726,
+    "BBL": 1.1303,
+    "BBNPNBETF": 0.0837,
+    "BBNPPGOLD": 2.3179,
+    "BBOX": 17.7495,
+    "BBTC": 6.9772,
+    "BBTCL": 2.0511,
+    "BCG": 201.7921,
+    "BCLIND": 29.5163,
+    "BCONCEPTS": 1.2482,
+    "BCPL": 1.6723,
+    "BDL": 36.6562,
+    "BEARDSELL": 3.9439,
+    "BECTORFOOD": 30.6991,
+    "BEDMUTHA": 3.2264,
+    "BEEKAY": 1.9072,
+    "BEL": 730.9779,
+    "BELLACASA": 1.3387,
+    "BELRISE": 88.9879,
+    "BEML": 8.3289,
+    "BENGALASM": 1.1404,
+    "BEPL": 24.8858,
+    "BERGEPAINT": 116.6003,
+    "BESTAGRO": 35.4673,
+    "BETA": 1.0137,
+    "BFINVEST": 3.7668,
+    "BFSI": 16.5289,
+    "BFUTILITIE": 3.7668,
+    "BHAGCHEM": 12.9669,
+    "BHAGERIA": 4.3644,
+    "BHARATCOAL": 465.7001,
+    "BHARATFORG": 47.8019,
+    "BHARATGEAR": 1.5355,
+    "BHARATRAS": 1.6621,
+    "BHARATSE": 6.28,
+    "BHARATWIRE": 6.8585,
+    "BHARTIARTL": 609.3279,
+    "BHARTIHEXA": 50.0,
+    "BHEL": 348.2063,
+    "BI": 2.3544,
+    "BIGBLOC": 14.1577,
+    "BIKAJI": 25.0736,
+    "BIL": 1.341,
+    "BIMETAL": 0.3825,
+    "BIOCON": 162.0908,
+    "BIOFILCHEM": 1.6274,
+    "BIRLACORPN": 7.7005,
+    "BIRLAMONEY": 5.6509,
+    "BIRLANU": 0.7541,
+    "BIRLAPREC": 6.8387,
+    "BLACKBUCK": 18.2078,
+    "BLACKROSE": 5.1,
+    "BLAL": 4.1644,
+    "BLBLIMITED": 5.2866,
+    "BLIL": 22.1972,
+    "BLISSGVS": 10.5789,
+    "BLKASHYAP": 22.544,
+    "BLS": 41.1741,
+    "BLSE": 9.0856,
+    "BLUECHIP": 5.5306,
+    "BLUEDART": 2.3728,
+    "BLUEJET": 17.3465,
+    "BLUESTARCO": 20.5615,
+    "BLUESTONE": 15.2361,
+    "BLUSPRING": 14.944,
+    "BMWVENTLTD": 8.6716,
+    "BNALTD": 0.31,
+    "BOMDYEING": 20.6535,
+    "BONLON": 1.4182,
+    "BORANA": 2.6645,
+    "BOROLTD": 11.9588,
+    "BORORENEW": 14.0189,
+    "BOROSCI": 8.8947,
+    "BOSCH-HCIL": 2.7191,
+    "BOSCHLTD": 2.9494,
+    "BPCL": 433.8433,
+    "BPL": 4.8976,
+    "BRIGADE": 24.4622,
+    "BRIGHOTEL": 37.9843,
+    "BRITANNIA": 24.0868,
+    "BRNL": 8.3948,
+    "BSE": 40.7884,
+    "BSE500IETF": 9.1824,
+    "BSL": 1.0292,
+    "BSLGOLDETF": 22.4023,
+    "BSLNIFTY": 113.4378,
+    "BSLSENETFG": 3.4837,
+    "BSOFT": 27.9506,
+    "BTML": 18.1692,
+    "BTTL": 5.8373,
+    "BUILDPRO": 2.4249,
+    "BUTTERFLY": 1.788,
+    "BVCL": 2.216,
+    "BYKE": 5.2281,
+    "CAMLINFINE": 19.2097,
+    "CAMPUS": 30.5593,
+    "CAMS": 24.7984,
+    "CANBK": 907.0651,
+    "CANFINHOME": 13.3154,
+    "CANHLIFE": 95.0,
+    "CANTABIL": 8.3638,
+    "CAPACITE": 8.4604,
+    "CAPILLARY": 7.9472,
+    "CAPITALSFB": 4.5432,
+    "CAPLIPOINT": 7.6012,
+    "CARBORUNIV": 19.0494,
+    "CARERATING": 3.0049,
+    "CARRARO": 5.6852,
+    "CARTRADE": 4.7928,
+    "CARYSIL": 2.8443,
+    "CASHIETF": 0.8505,
+    "CASTROLIND": 98.9065,
+    "CCAVENUE": 348.8226,
+    "CCCL": 44.676,
+    "CCHHL": 16.3469,
+    "CCL": 13.3528,
+    "CDSL": 20.9,
+    "CEATLTD": 4.045,
+    "CEIGALL": 17.4205,
+    "CEINSYS": 1.7841,
+    "CELEBRITY": 6.4554,
+    "CELLO": 22.0885,
+    "CEMPRO": 17.1788,
+    "CENTENKA": 2.1851,
+    "CENTEXT": 8.0,
+    "CENTRALBK": 905.1403,
+    "CENTRUM": 48.6827,
+    "CENTUM": 1.4759,
+    "CENTURYPLY": 22.2173,
+    "CERA": 1.2898,
+    "CESC": 132.557,
+    "CEWATER": 2.0696,
+    "CGCL": 96.2154,
+    "CGPOWER": 157.4957,
+    "CHALET": 21.8994,
+    "CHAMBLFERT": 40.065,
+    "CHEMCON": 3.6631,
+    "CHEMICAL": 3.2555,
+    "CHEMPLASTS": 15.8109,
+    "CHENNPETRO": 14.8911,
+    "CHEVIOT": 0.5842,
+    "CHOICEGOLD": 0.345,
+    "CHOICEIN": 22.2777,
+    "CHOLAFIN": 85.2324,
+    "CHOLAHLDNG": 18.7777,
+    "CIEINDIA": 37.9362,
+    "CIFL": 39.1058,
+    "CINELINE": 3.4266,
+    "CINEVISTA": 5.7434,
+    "CIPLA": 80.7801,
+    "CLEAN": 10.6277,
+    "CLEANMAX": 11.7087,
+    "CLSEL": 4.9726,
+    "CMPDI": 71.4,
+    "CMSINFO": 16.4638,
+    "CNL": 1.5017,
+    "COALINDIA": 616.2728,
+    "COASTCORP": 6.6976,
+    "COCHINSHIP": 26.3081,
+    "COCKERILL": 0.4938,
+    "COFFEEDAY": 21.1252,
+    "COFORGE": 42.9958,
+    "COHANCE": 38.2567,
+    "COLPAL": 27.1986,
+    "COMFINTE": 31.9935,
+    "COMMOIETF": 1.3316,
+    "COMPUSOFT": 7.9123,
+    "COMSYN": 4.0339,
+    "CONCOR": 76.1618,
+    "CONCORDBIO": 10.4616,
+    "CONFIPET": 33.2242,
+    "CONS": 2.9652,
+    "CONSOFINVT": 3.2326,
+    "CONSUMBEES": 1.5876,
+    "CONSUMER": 4.677,
+    "CONSUMIETF": 0.4738,
+    "CONTROLPR": 1.5994,
+    "CORALFINAC": 4.0303,
+    "COROMANDEL": 29.5015,
+    "CORONA": 6.116,
+    "COSMOFIRST": 2.625,
+    "COUNCODOS": 7.7602,
+    "CPEDU": 1.8193,
+    "CPPLUS": 11.785,
+    "CPSEETF": 206.2627,
+    "CRAFTSMAN": 2.3856,
+    "CRAMC": 19.9417,
+    "CREATIVEYE": 2.0061,
+    "CREDITACC": 16.0233,
+    "CREST": 2.845,
+    "CRISIL": 7.313,
+    "CRIZAC": 17.4982,
+    "CROMPTON": 64.3915,
+    "CROWN": 1.159,
+    "CSBBANK": 17.3486,
+    "CSLFINANCE": 2.2782,
+    "CTE": 1.9632,
+    "CUB": 74.309,
+    "CUBEXTUB": 1.4318,
+    "CUMMINSIND": 27.72,
+    "CUPID": 134.466,
+    "CYBERTECH": 3.113,
+    "CYIENT": 11.1129,
+    "CYIENTDLM": 7.9364,
+    "DABUR": 177.369,
+    "DAICHI": 0.7451,
+    "DALBHARAT": 18.7566,
+    "DALMIASUG": 8.0939,
+    "DAMCAPITAL": 7.0686,
+    "DAMODARIND": 2.33,
+    "DANGEE": 15.3976,
+    "DATAMATICS": 5.9106,
+    "DATAPATTNS": 5.5984,
+    "DAVANGERE": 143.0,
+    "DBCORP": 17.8246,
+    "DBL": 16.2445,
+    "DBSTOCKBRO": 3.4998,
+    "DCAL": 15.6783,
+    "DCBBANK": 32.2053,
+    "DCM": 1.8677,
+    "DCMSHRIRAM": 15.5942,
+    "DCMSRIND": 8.6991,
+    "DCW": 29.5155,
+    "DCXINDIA": 11.1386,
+    "DDEVPLSTIK": 10.3476,
+    "DECCANCE": 1.4007,
+    "DECNGOLD": 19.7902,
+    "DEEPAKFERT": 12.6238,
+    "DEEPAKNTR": 13.6393,
+    "DEEPINDS": 6.4,
+    "DEFENCE": 1.3074,
+    "DELHIVERY": 74.8718,
+    "DELPHIFX": 24.5269,
+    "DELTACORP": 26.7771,
+    "DELTAMAGNT": 1.0852,
+    "DEN": 47.7226,
+    "DENORA": 0.5309,
+    "DENTA": 2.67,
+    "DEVIT": 5.6364,
+    "DEVX": 9.0188,
+    "DEVYANI": 123.2939,
+    "DGCONTENT": 5.8188,
+    "DHAMPURSUG": 6.4307,
+    "DHANBANK": 39.4698,
+    "DHANUKA": 4.5078,
+    "DHARMAJ": 3.3797,
+    "DHUNINV": 0.6097,
+    "DIACABS": 52.6971,
+    "DIAMINESQ": 0.9784,
+    "DIAMONDYD": 2.3911,
+    "DICIND": 0.9179,
+    "DIFFNKG": 3.7426,
+    "DIGIDRIVE": 3.8562,
+    "DIGITIDE": 14.911,
+    "DIGJAMLMTD": 2.0,
+    "DISAQ": 0.1454,
+    "DIVGIITTS": 3.0583,
+    "DIVIDEND": 0.2845,
+    "DIVISLAB": 26.5469,
+    "DIVOPPBEES": 0.9138,
+    "DIXON": 6.1086,
+    "DJML": 3.4377,
+    "DLF": 247.5315,
+    "DLINKINDIA": 3.5505,
+    "DMART": 65.2164,
+    "DMCC": 2.494,
+    "DNAMEDIA": 11.7718,
+    "DODLA": 6.0328,
+    "DOLATALGO": 17.6,
+    "DOLLAR": 5.6716,
+    "DOLPHIN": 4.0005,
+    "DOMS": 6.0688,
+    "DONEAR": 5.2,
+    "DPABHUSHAN": 2.2828,
+    "DPWIRES": 1.5501,
+    "DRAGARWQ": 0.4833,
+    "DRCSYSTEMS": 14.4082,
+    "DREAMFOLKS": 5.327,
+    "DREDGECORP": 2.8,
+    "DRREDDY": 83.4636,
+    "DSFCL": 8.6994,
+    "DSSL": 1.2737,
+    "DTIL": 1.0507,
+    "DVL": 3.5025,
+    "DWARKESH": 18.5301,
+    "DYCL": 4.8459,
+    "DYNAMATECH": 0.6791,
+    "DYNPRO": 1.2428,
+    "E2E": 2.0556,
+    "EASEMYTRIP": 363.6857,
+    "EBANKNIFTY": 0.0591,
+    "EBBETF0430": 15.8808,
+    "EBBETF0431": 9.3511,
+    "EBBETF0433": 4.8642,
+    "EBGNG": 11.4012,
+    "ECAPINSURE": 0.5981,
+    "ECLERX": 9.4051,
+    "EDELWEISS": 94.6531,
+    "EFCIL": 14.7946,
+    "EGOLD": 10.1748,
+    "EICHERMOT": 27.4498,
+    "EIDPARRY": 17.7926,
+    "EIEL": 17.553,
+    "EIFFL": 2.48,
+    "EIHAHOTELS": 6.0936,
+    "EIHOTEL": 62.5364,
+    "EIMCOELECO": 0.5768,
+    "EKC": 11.2207,
+    "ELANTAS": 0.7928,
+    "ELCIDIN": 0.02,
+    "ELDEHSG": 0.9833,
+    "ELECON": 22.44,
+    "ELECTCAST": 61.8185,
+    "ELECTHERM": 1.2743,
+    "ELGIEQUIP": 31.6909,
+    "ELGIRUBCO": 5.0049,
+    "ELIN": 4.9709,
+    "ELIQUID": 0.0492,
+    "ELITECON": 159.8502,
+    "ELLEN": 14.0936,
+    "ELM250": 9.6991,
+    "ELPROINTL": 16.9479,
+    "EMAMILTD": 43.65,
+    "EMAMIPAP": 6.0499,
+    "EMBDL": 139.0634,
+    "EMCURE": 18.959,
+    "EMIL": 38.4749,
+    "EMKAY": 2.6337,
+    "EMMBI": 1.924,
+    "EMMVEE": 69.2345,
+    "EMSLIMITED": 5.5531,
+    "EMUDHRA": 8.2812,
+    "EMULTIMQ": 0.7993,
+    "ENDURANCE": 14.0663,
+    "ENERGY": 7.9609,
+    "ENERGYDEV": 4.7497,
+    "ENEXT50": 0.1029,
+    "ENGINERSIN": 56.2043,
+    "ENIFTY": 0.6567,
+    "ENIL": 4.767,
+    "ENRIN": 35.6121,
+    "ENTERO": 4.3511,
+    "EPACK": 9.6228,
+    "EPACKPEB": 10.0615,
+    "EPIGRAL": 4.3141,
+    "EPL": 32.0337,
+    "EQUAL200": 1.4314,
+    "EQUAL50": 0.5358,
+    "EQUAL50ADD": 4.0932,
+    "EQUITASBNK": 114.1573,
+    "ERIS": 13.8567,
+    "ESABINDIA": 1.5393,
+    "ESAFSFB": 51.5677,
+    "ESCORTS": 11.1878,
+    "ESENSEX": 0.1919,
+    "ESG": 2.4388,
+    "ESILVER": 6.7237,
+    "ESSARSHPNG": 20.6977,
+    "ESTER": 9.7586,
+    "ETERNAL": 965.0351,
+    "ETHOSLTD": 2.6758,
+    "EUREKAFORB": 19.3404,
+    "EUROBOND": 2.45,
+    "EUROPRATIK": 10.22,
+    "EUROTEXIND": 0.875,
+    "EVEREADY": 7.2687,
+    "EVERESTIND": 1.5856,
+    "EVIETF": 1.9641,
+    "EVINDIA": 5.4747,
+    "EXCELINDUS": 1.2571,
+    "EXCELSOFT": 11.5084,
+    "EXICOM": 13.908,
+    "EXIDEIND": 85.0,
+    "EXPLEOSOL": 1.552,
+    "EXXARO": 44.7408,
+    "FABTECH": 4.4451,
+    "FACT": 64.7072,
+    "FAIRCHEMOR": 1.2596,
+    "FAZE3Q": 2.4319,
+    "FCL": 116.4502,
+    "FDC": 16.281,
+    "FEDDERSHOL": 20.1416,
+    "FEDERALBNK": 246.4857,
+    "FEDFINA": 37.4323,
+    "FERMENTA": 2.9431,
+    "FIBERWEB": 2.8792,
+    "FIEMIND": 2.632,
+    "FILATEX": 44.4058,
+    "FINCABLES": 15.2939,
+    "FINEORG": 3.066,
+    "FINIETF": 8.9564,
+    "FINKURVE": 14.0144,
+    "FINOPB": 8.3218,
+    "FINPIPE": 62.0477,
+    "FIRSTCRY": 52.2067,
+    "FISCHER": 64.8515,
+    "FIVESTAR": 29.518,
+    "FLAIR": 10.5395,
+    "FLEXIADD": 1.4517,
+    "FLEXITUFF": 3.2826,
+    "FLUOROCHEM": 10.985,
+    "FMCGADD": 0.1137,
+    "FMCGIETF": 14.5434,
+    "FMGOETZE": 5.5632,
+    "FOCUS": 6.7445,
+    "FOODSIN": 7.3531,
+    "FORCEMOT": 1.3033,
+    "FORTIS": 75.4958,
+    "FOSECOIND": 0.7537,
+    "FRACTAL": 17.1965,
+    "FRONTSP": 1.1816,
+    "FSL": 69.6991,
+    "FUSION": 16.1684,
+    "GABRIEL": 14.3644,
+    "GAEL": 45.8671,
+    "GAIL": 657.5099,
+    "GALAPREC": 1.2798,
+    "GALAXYSURF": 3.5455,
+    "GALLANTT": 24.1281,
+    "GANDHAR": 9.7879,
+    "GANDHITUBE": 1.2152,
+    "GANECOS": 2.6796,
+    "GANESHBE": 7.1989,
+    "GANESHCP": 4.0413,
+    "GANESHHOU": 8.3387,
+    "GANGAFORGE": 13.4823,
+    "GANGESSECU": 1.0003,
+    "GARFIBRES": 9.9266,
+    "GARUDA": 9.3042,
+    "GATECH": 110.2727,
+    "GATECHDVR": 18.96,
+    "GATEWAY": 49.9643,
+    "GAYAHWS": 23.9648,
+    "GCSL": 2.4159,
+    "GEECEE": 2.0912,
+    "GEEKAYWIRE": 10.4519,
+    "GENCON": 5.6987,
+    "GENESYS": 4.179,
+    "GENUSPAPER": 25.7125,
+    "GENUSPOWER": 30.4243,
+    "GEOJITFSL": 27.9122,
+    "GESHIP": 14.2767,
+    "GFLLIMITED": 10.985,
+    "GHCL": 9.2131,
+    "GHCLTEXTIL": 9.5585,
+    "GICHSGFIN": 5.3851,
+    "GICL": 11.1954,
+    "GICRE": 175.44,
+    "GILLANDERS": 2.1342,
+    "GILLETTE": 3.2585,
+    "GILT10BETA": 0.8994,
+    "GILT5BETA": 0.3944,
+    "GILT5YBEES": 3.8855,
+    "GINNIFILA": 8.5649,
+    "GIPCL": 15.5216,
+    "GKENERGY": 20.2817,
+    "GKSL": 7.8844,
+    "GKWLIMITED": 0.5966,
+    "GLAND": 16.4756,
+    "GLAXO": 16.9406,
+    "GLENMARK": 28.2201,
+    "GLOBAL": 5.0902,
+    "GLOBALVECT": 1.4,
+    "GLOBE": 45.0435,
+    "GLOBUSSPR": 2.908,
+    "GLOSTERLTD": 1.0943,
+    "GMBREW": 2.2847,
+    "GMDCLTD": 31.8,
+    "GMMPFAUDLR": 4.4957,
+    "GMRAIRPORT": 1055.8976,
+    "GMRP&UI": 78.1018,
+    "GNA": 4.2931,
+    "GNFC": 14.6941,
+    "GNRL": 12.8402,
+    "GOACARBON": 0.9151,
+    "GOCLCORP": 4.9573,
+    "GOCOLORS": 5.2596,
+    "GODAVARIB": 5.1176,
+    "GODFRYPHLP": 15.5982,
+    "GODIGIT": 92.4554,
+    "GODREJAGRO": 19.236,
+    "GODREJCP": 102.3245,
+    "GODREJIND": 33.6805,
+    "GODREJPROP": 30.1208,
+    "GOKEX": 7.3274,
+    "GOKUL": 9.8995,
+    "GOKULAGRO": 29.5087,
+    "GOLD1": 115.0046,
+    "GOLD360": 0.9178,
+    "GOLDADD": 16.3783,
+    "GOLDBEES": 442.9156,
+    "GOLDBETA": 33.54,
+    "GOLDBND": 0.0711,
+    "GOLDCASE": 94.9416,
+    "GOLDETF": 22.3482,
+    "GOLDIAM": 11.2918,
+    "GOLDIETF": 207.1539,
+    "GOLDTECH": 5.2262,
+    "GOODLUCK": 3.3239,
+    "GOODYEAR": 2.3067,
+    "GOPAL": 12.4667,
+    "GOYALALUM": 14.2737,
+    "GPIL": 67.2726,
+    "GPPL": 48.344,
+    "GPTHEALTH": 8.2055,
+    "GPTINFRA": 12.6365,
+    "GRADIENTE": 33.241,
+    "GRANDOAK": 51.8883,
+    "GRANULES": 24.7797,
+    "GRAPHITE": 19.5376,
+    "GRASIM": 68.0525,
+    "GRAUWEIL": 45.3411,
+    "GRAVISSHO": 7.052,
+    "GRAVITA": 7.3808,
+    "GREAVESCOT": 23.2951,
+    "GREENLAM": 25.5148,
+    "GREENPANEL": 12.2628,
+    "GREENPLY": 12.4902,
+    "GREENPOWER": 117.3031,
+    "GRINDWELL": 11.072,
+    "GRINFRA": 9.6761,
+    "GRMOVER": 20.721,
+    "GROBTEA": 0.1162,
+    "GROWW": 627.3597,
+    "GROWWCAPM": 3.4528,
+    "GROWWCHEM": 0.3855,
+    "GROWWDEFNC": 3.6362,
+    "GROWWEV": 9.0597,
+    "GROWWGOLD": 30.0763,
+    "GROWWHOSPI": 1.0301,
+    "GROWWLIQID": 1.0902,
+    "GROWWLOVOL": 0.4058,
+    "GROWWMC150": 0.0275,
+    "GROWWMETAL": 3.2306,
+    "GROWWMOM50": 2.4632,
+    "GROWWN200": 1.5173,
+    "GROWWNET": 3.7022,
+    "GROWWNIFTY": 3.3996,
+    "GROWWNXT50": 0.1216,
+    "GROWWPOWER": 20.0644,
+    "GROWWPSE": 0.174,
+    "GROWWPSUBK": 0.0778,
+    "GROWWRAIL": 4.5211,
+    "GROWWRLTY": 1.7614,
+    "GROWWSC250": 1.599,
+    "GROWWSLVR": 13.0293,
+    "GRPLTD": 0.5333,
+    "GRSE": 11.4552,
+    "GRWRHITECH": 2.3232,
+    "GSEC10IETF": 2.2616,
+    "GSEC10YEAR": 2.9162,
+    "GSEC5IETF": 0.3129,
+    "GSFC": 39.8477,
+    "GSLSU": 4.2382,
+    "GSPCROP": 4.6519,
+    "GTECJAINX": 1.0189,
+    "GTL": 15.7291,
+    "GTLINFRA": 1271.6667,
+    "GTPL": 11.2463,
+    "GUFICBIO": 10.0283,
+    "GUJALKALI": 7.3437,
+    "GUJAPOLLO": 1.297,
+    "GUJGASLTD": 68.839,
+    "GUJRAFFIA": 0.5404,
+    "GUJTHEM": 10.8965,
+    "GULFOILLUB": 4.9508,
+    "GULFPETRO": 5.0983,
+    "GULPOLY": 6.2371,
+    "GVPIL": 6.7228,
+    "GVPTECH": 18.403,
+    "GVT&D": 25.6047,
+    "HAL": 66.8775,
+    "HALDER": 1.2438,
+    "HALDYNGL": 5.3752,
+    "HALEOSLABS": 0.3023,
+    "HAPPSTMNDS": 15.2275,
+    "HAPPYFORGE": 9.435,
+    "HARDWYN": 48.8432,
+    "HARIOMPIPE": 3.0967,
+    "HARRMALAYA": 1.8455,
+    "HARSHA": 9.1044,
+    "HATHWAY": 177.0104,
+    "HATSUN": 22.2748,
+    "HAVELLS": 62.7257,
+    "HAVISHA": 15.3533,
+    "HAWKINCOOK": 0.5288,
+    "HBESD": 2.2961,
+    "HBLENGINE": 27.7195,
+    "HCC": 261.9469,
+    "HCG": 14.9302,
+    "HCL-INSYS": 32.9212,
+    "HCLTECH": 271.3665,
+    "HDBFS": 83.0349,
+    "HDFCAMC": 42.8653,
+    "HDFCBANK": 1539.7649,
+    "HDFCBSE500": 0.6248,
+    "HDFCGOLD": 172.2782,
+    "HDFCGROWTH": 0.1864,
+    "HDFCLIFE": 215.7951,
+    "HDFCLIQUID": 0.0579,
+    "HDFCLOWVOL": 1.7027,
+    "HDFCMID150": 8.2288,
+    "HDFCMOMENT": 4.1515,
+    "HDFCNEXT50": 2.4272,
+    "HDFCNIF100": 2.9588,
+    "HDFCNIFBAN": 95.6201,
+    "HDFCNIFIT": 3.9045,
+    "HDFCNIFTY": 18.3914,
+    "HDFCPSUBK": 0.4082,
+    "HDFCPVTBAN": 27.345,
+    "HDFCQUAL": 0.3511,
+    "HDFCSENSEX": 10.9033,
+    "HDFCSILVER": 32.1911,
+    "HDFCSML250": 13.6022,
+    "HDFCVALUE": 0.2621,
+    "HEADSUP": 2.2083,
+    "HEALTHADD": 0.0975,
+    "HEALTHCARE": 0.6064,
+    "HEALTHIETF": 1.2971,
+    "HEALTHX": 3.181,
+    "HEALTHY": 4.8703,
+    "HECPROJECT": 1.0838,
+    "HEG": 19.2978,
+    "HEIDELBERG": 22.6613,
+    "HEMIPROP": 28.5,
+    "HERANBA": 4.0013,
+    "HERITGFOOD": 9.2796,
+    "HEROMOTOCO": 20.0093,
+    "HESTERBIO": 0.8507,
+    "HEXATRADEX": 5.5245,
+    "HEXT": 61.1016,
+    "HFCL": 153.0603,
+    "HGINFRA": 6.5171,
+    "HGM": 1.2595,
+    "HGS": 4.652,
+    "HIKAL": 12.3301,
+    "HIMATSEIDE": 12.5743,
+    "HINDALCO": 224.7227,
+    "HINDCOMPOS": 1.4769,
+    "HINDCOPPER": 96.7024,
+    "HINDOILEXP": 13.2243,
+    "HINDPETRO": 212.7822,
+    "HINDUNILVR": 234.9591,
+    "HINDWAREAP": 8.3646,
+    "HINDZINC": 422.5319,
+    "HIRECT": 3.4372,
+    "HISARMETAL": 0.54,
+    "HITECH": 20.3108,
+    "HLEGLAS": 6.9455,
+    "HLVLTD": 65.9262,
+    "HMAAGRO": 50.077,
+    "HMVL": 7.3671,
+    "HNDFDS": 11.9482,
+    "HNGSNGBEES": 2.3587,
+    "HOMEFIRST": 10.4458,
+    "HONASA": 32.537,
+    "HONAUT": 0.8842,
+    "HONDAPOWER": 1.0143,
+    "HPAL": 9.1874,
+    "HPIL": 1.1424,
+    "HPL": 6.43,
+    "HSBCGOLD": 4.5618,
+    "HSCL": 50.4542,
+    "HTMEDIA": 18.2653,
+    "HUBTOWN": 14.21,
+    "HUDCO": 200.19,
+    "HUHTAMAKI": 7.5522,
+    "HYBRIDFIN": 2.9437,
+    "HYUNDAI": 81.2541,
+    "ICDSLTD": 1.3026,
+    "ICEMAKE": 1.578,
+    "ICICIAMC": 49.4259,
+    "ICICIB22": 87.3161,
+    "ICICIBANK": 717.0491,
+    "ICICIGI": 49.9025,
+    "ICICIPRULI": 145.0525,
+    "ICIL": 19.8054,
+    "ICRA": 0.9651,
+    "IDBI": 1075.2402,
+    "IDEA": 10834.3035,
+    "IDFCFIRSTB": 861.0909,
+    "IDFNIFTYET": 0.0143,
+    "IEX": 89.1692,
+    "IFBIND": 4.0519,
+    "IFCI": 269.4315,
+    "IFGLEXPOR": 7.2079,
+    "IGARASHI": 3.1475,
+    "IGCL": 6.3224,
+    "IGIL": 43.216,
+    "IGL": 140.0002,
+    "IGPL": 3.0795,
+    "IIFL": 42.5325,
+    "IIFLCAPS": 31.1435,
+    "IITL": 2.2547,
+    "IKIO": 7.7281,
+    "IKS": 17.1573,
+    "IMAGICAA": 56.586,
+    "IMFA": 5.3954,
+    "IMPAL": 1.248,
+    "INA": 22.0394,
+    "INCREDIBLE": 4.6763,
+    "INDBANK": 4.4378,
+    "INDGN": 24.0954,
+    "INDHOTEL": 142.3432,
+    "INDIACEM": 30.9897,
+    "INDIAGLYCO": 6.7027,
+    "INDIAMART": 6.0143,
+    "INDIANB": 134.6964,
+    "INDIANCARD": 0.5941,
+    "INDIANHUME": 5.2682,
+    "INDIASHLTR": 10.8785,
+    "INDIGO": 38.6656,
+    "INDIGOPNTS": 4.7676,
+    "INDIQUBE": 21.1997,
+    "INDNIPPON": 2.2621,
+    "INDOAMIN": 7.2588,
+    "INDOBORAX": 3.209,
+    "INDOCO": 9.2304,
+    "INDOFARM": 4.8051,
+    "INDORAMA": 26.1113,
+    "INDOSTAR": 16.1615,
+    "INDOTHAI": 12.8618,
+    "INDOUS": 2.0052,
+    "INDPRUD": 0.1676,
+    "INDRAMEDCO": 9.1673,
+    "INDSWFTLAB": 8.6837,
+    "INDTERRAIN": 5.0667,
+    "INDUSINDBK": 77.9111,
+    "INDUSTOWER": 263.8163,
+    "INFOBEAN": 9.7606,
+    "INFOMEDIA": 5.02,
+    "INFRA": 0.8592,
+    "INFRABEES": 0.193,
+    "INFRAIETF": 4.2371,
+    "INFY": 405.636,
+    "INGERRAND": 3.1568,
+    "INNOVACAP": 5.7225,
+    "INNOVANA": 2.066,
+    "INNOVISION": 2.3813,
+    "INOXGREEN": 40.1492,
+    "INOXINDIA": 9.0763,
+    "INOXWIND": 172.8238,
+    "INSECTICID": 2.9098,
+    "INTELLECT": 14.0011,
+    "INTENTECH": 2.3624,
+    "INTERARCH": 1.6772,
+    "INTERNET": 2.3292,
+    "INTLCONV": 6.3781,
+    "INVENTURE": 105.0,
+    "INVPRECQ": 1.0,
+    "IOB": 1925.6589,
+    "IOC": 1412.1239,
+    "IOLCP": 29.3527,
+    "IONEXCHANG": 14.6666,
+    "IPCALAB": 25.3704,
+    "IPL": 11.5164,
+    "IRB": 1207.8002,
+    "IRCON": 94.0516,
+    "IRCTC": 80.0,
+    "IREDA": 280.9232,
+    "IRFC": 1306.8506,
+    "IRIS": 2.0568,
+    "IRISDOREME": 19.0331,
+    "IRMENERGY": 4.106,
+    "ISFT": 1.6312,
+    "ISGEC": 7.353,
+    "ISHANCH": 2.614,
+    "IT": 7.4064,
+    "ITADD": 4.9494,
+    "ITBEES": 104.4718,
+    "ITBETA": 0.0207,
+    "ITC": 1253.2023,
+    "ITCHOTELS": 208.2976,
+    "ITDC": 8.5769,
+    "ITETF": 3.0465,
+    "ITI": 96.0887,
+    "ITIETF": 14.5009,
+    "IVALUE": 5.4631,
+    "IVC": 31.4037,
+    "IVP": 1.0326,
+    "IVZINGOLD": 5.6816,
+    "IVZINNIFTY": 0.0337,
+    "IWP": 6.3971,
+    "IXIGO": 43.8669,
+    "IZMO": 1.4963,
+    "J&KBANK": 110.1182,
+    "JAGRAN": 21.7654,
+    "JAGSNPHARM": 6.7139,
+    "JAICORPLTD": 17.5505,
+    "JAINREC": 34.5086,
+    "JAIPURKURT": 1.9092,
+    "JAMNAAUTO": 39.9787,
+    "JARO": 2.2179,
+    "JASH": 6.3194,
+    "JAYAGROGN": 3.0,
+    "JAYBARMARU": 10.825,
+    "JAYKAY": 13.0287,
+    "JAYNECOIND": 97.0999,
+    "JAYSREETEA": 2.8878,
+    "JBCHEPHARM": 16.0559,
+    "JBMA": 23.6494,
+    "JETFREIGHT": 4.6404,
+    "JGCHEM": 3.9186,
+    "JHS": 8.5602,
+    "JINDALPHOT": 1.0258,
+    "JINDALPOLY": 4.3786,
+    "JINDALSAW": 63.9508,
+    "JINDALSTEL": 102.0088,
+    "JINDRILL": 2.8981,
+    "JINDWORLD": 100.2602,
+    "JIOFIN": 660.3142,
+    "JISLDVREQS": 1.9296,
+    "JISLJALEQS": 71.4611,
+    "JITFINFRA": 2.5704,
+    "JKCEMENT": 7.7268,
+    "JKIL": 7.5666,
+    "JKLAKSHMI": 12.4144,
+    "JKPAPER": 16.9402,
+    "JKTYRE": 28.8289,
+    "JLHL": 6.5566,
+    "JMA": 2.2841,
+    "JMFINANCIL": 95.6466,
+    "JNKINDIA": 5.5954,
+    "JPOLYINVST": 1.0512,
+    "JPPOWER": 685.3459,
+    "JSFB": 10.5325,
+    "JSL": 82.442,
+    "JSLL": 12.4301,
+    "JSWCEMENT": 136.3365,
+    "JSWDULUX": 4.554,
+    "JSWENERGY": 183.3483,
+    "JSWHL": 1.11,
+    "JSWINFRA": 210.0001,
+    "JSWSTEEL": 244.5454,
+    "JTEKTINDIA": 27.7312,
+    "JTLIND": 39.3081,
+    "JUBLCPL": 1.5153,
+    "JUBLFOOD": 65.9845,
+    "JUBLINGREA": 15.9281,
+    "JUBLPHARMA": 15.9281,
+    "JUNIORBEES": 10.5827,
+    "JUNIPER": 22.2502,
+    "JUSTDIAL": 8.5049,
+    "JWL": 42.737,
+    "JYOTHYLAB": 36.7214,
+    "JYOTICNC": 22.7423,
+    "JYOTISTRUC": 119.3663,
+    "KABRAEXTRU": 3.4973,
+    "KAJARIACER": 15.9272,
+    "KALAMANDIR": 15.3366,
+    "KALPATARU": 20.5914,
+    "KALYANIFRG": 0.3638,
+    "KALYANKJIL": 103.274,
+    "KAMAHOLD": 3.2091,
+    "KAMATHOTEL": 2.948,
+    "KAMDHENU": 28.1884,
+    "KAMOPAINTS": 32.9004,
+    "KANANIIND": 19.7885,
+    "KANPRPLA": 2.4012,
+    "KANSAINER": 80.8658,
+    "KAPSTON": 3.0432,
+    "KARMAENG": 1.157,
+    "KARURVYSYA": 96.6494,
+    "KAUSHALYA": 0.0346,
+    "KAVDEFENCE": 6.0125,
+    "KAYA": 1.5188,
+    "KAYNES": 6.7035,
+    "KCP": 12.8921,
+    "KCPSUGIND": 11.3384,
+    "KDDL": 1.2299,
+    "KEC": 26.62,
+    "KEEPLEARN": 15.5721,
+    "KEI": 9.5601,
+    "KELLTONTEC": 52.7806,
+    "KENNAMET": 2.1978,
+    "KERNEX": 1.6802,
+    "KEYFINSERV": 0.5567,
+    "KFINTECH": 17.2615,
+    "KHADIM": 1.8378,
+    "KHANDSE": 1.5254,
+    "KICL": 0.4365,
+    "KILITCH": 3.4961,
+    "KIMS": 40.0139,
+    "KINGFA": 1.3551,
+    "KIOCL": 60.7751,
+    "KIRANVYPAR": 2.7284,
+    "KIRIINDUS": 6.0023,
+    "KIRLFER": 16.4922,
+    "KIRLOSBROS": 7.9409,
+    "KIRLOSENG": 14.5368,
+    "KIRLOSIND": 1.0509,
+    "KIRLPNU": 6.4958,
+    "KISSHT": 16.8483,
+    "KITEX": 19.95,
+    "KKCL": 6.1625,
+    "KLBRENG-B": 5.2313,
+    "KMEW": 2.4444,
+    "KMSUGAR": 9.2001,
+    "KNAGRI": 2.4999,
+    "KNRCON": 28.1235,
+    "KOHINOOR": 3.707,
+    "KOKUYOCMLN": 10.0304,
+    "KOLTEPATIL": 8.868,
+    "KOTAKBANK": 994.6509,
+    "KOTARISUG": 8.2888,
+    "KOTHARIPET": 5.8847,
+    "KOTHARIPRO": 5.9688,
+    "KOTIC": 10.8022,
+    "KOTYARK": 1.0279,
+    "KOVAI": 1.0942,
+    "KPEL": 6.7596,
+    "KPIGREEN": 19.7341,
+    "KPIL": 17.0773,
+    "KPITTECH": 27.4144,
+    "KPL": 1.0376,
+    "KPRMILL": 34.1814,
+    "KRBL": 22.889,
+    "KREBSBIO": 2.1561,
+    "KRIDHANINF": 9.4774,
+    "KRISHANA": 6.1828,
+    "KRISHIVAL": 2.5628,
+    "KRISHNADEF": 1.4933,
+    "KRITIKA": 26.6273,
+    "KRONOX": 3.7104,
+    "KROSS": 6.4509,
+    "KRSNAA": 3.2439,
+    "KRYSTAL": 1.3972,
+    "KSB": 17.4039,
+    "KSCL": 5.1439,
+    "KSHINTL": 6.7756,
+    "KSL": 4.3653,
+    "KSOLVES": 2.372,
+    "KTKBANK": 37.819,
+    "KUANTUM": 8.7264,
+    "KWIL": 234.9592,
+    "LAGNAM": 1.7669,
+    "LAHOTIOV": 2.9173,
+    "LAL": 17.2742,
+    "LALPATHLAB": 16.7638,
+    "LAMBODHARA": 1.0377,
+    "LANCORHOL": 7.3551,
+    "LANDMARK": 4.1465,
+    "LANDSMILL": 141.0674,
+    "LAOPALA": 11.1,
+    "LASA": 5.0104,
+    "LATENTVIEW": 20.6925,
+    "LAURUSLABS": 53.9857,
+    "LAXMICOT": 1.7147,
+    "LAXMIDENTL": 5.4962,
+    "LEMERITE": 12.5169,
+    "LEMONTREE": 79.2247,
+    "LENSKART": 173.8721,
+    "LEXUS": 2.079,
+    "LFIC": 0.3,
+    "LGBBROSLTD": 3.1892,
+    "LGEINDIA": 67.8772,
+    "LGHL": 5.0093,
+    "LIBAS": 2.6345,
+    "LIBERTSHOE": 1.704,
+    "LICHSGFIN": 55.0063,
+    "LICI": 1264.9995,
+    "LICMFGOLD": 10.5038,
+    "LICNETFGSC": 65.3175,
+    "LICNETFN50": 3.2036,
+    "LICNETFSEN": 0.8248,
+    "LICNFNHGP": 2.6795,
+    "LICNMID100": 10.5889,
+    "LINC": 5.949,
+    "LINCOLN": 2.003,
+    "LINDEINDIA": 8.5284,
+    "LIQGRWBEES": 0.1081,
+    "LIQUID": 0.5774,
+    "LIQUID1": 1.5085,
+    "LIQUIDADD": 1.4785,
+    "LIQUIDBEES": 10.8666,
+    "LIQUIDBETF": 0.5937,
+    "LIQUIDCASE": 84.1641,
+    "LIQUIDETF": 0.4775,
+    "LIQUIDIETF": 1.193,
+    "LIQUIDPLUS": 0.6328,
+    "LIQUIDSBI": 0.0485,
+    "LIQUIDSHRI": 0.0366,
+    "LLOYDSENGG": 146.0757,
+    "LLOYDSENT": 150.3045,
+    "LLOYDSME": 54.5165,
+    "LMW": 1.0683,
+    "LODHA": 99.9002,
+    "LORDSCHLO": 2.8654,
+    "LOTUSDEV": 48.8724,
+    "LOTUSEYE": 2.0796,
+    "LOVABLE": 1.4799,
+    "LOWVOL": 0.2313,
+    "LOWVOL1": 9.8611,
+    "LOWVOLIETF": 157.8934,
+    "LPDC": 13.4137,
+    "LT": 137.5729,
+    "LTF": 250.545,
+    "LTFOODS": 34.7253,
+    "LTGILTBEES": 83.4767,
+    "LTGILTCASE": 4.0151,
+    "LTM": 29.6621,
+    "LTTS": 10.6069,
+    "LUMAXIND": 0.9348,
+    "LUMAXTECH": 6.8158,
+    "LUPIN": 45.7216,
+    "LUXIND": 3.0072,
+    "LXCHEM": 27.7211,
+    "LYKALABS": 3.5689,
+    "LYPSAGEMS": 2.948,
+    "M&M": 124.3529,
+    "M&MFIN": 138.9971,
+    "MAANALU": 5.9984,
+    "MACPOWER": 1.0004,
+    "MADHAV": 0.8946,
+    "MADHAVIPL": 26.9576,
+    "MADHUCON": 7.3789,
+    "MADRASFERT": 16.1101,
+    "MAFANG": 24.7304,
+    "MAFATIND": 7.2164,
+    "MAGADSUGAR": 1.4092,
+    "MAGNUM": 6.841,
+    "MAHABANK": 769.1541,
+    "MAHAPEXLTD": 2.8183,
+    "MAHEPC": 2.7951,
+    "MAHESHWARI": 2.9597,
+    "MAHKTECH": 19.371,
+    "MAHLIFE": 21.3343,
+    "MAHLOG": 9.9222,
+    "MAHSCOOTER": 1.1429,
+    "MAHSEAMLES": 13.3999,
+    "MAITHANALL": 2.9112,
+    "MAJESAUT": 1.0398,
+    "MAKEINDIA": 1.5845,
+    "MALLCOM": 0.624,
+    "MALUPAPER": 1.7059,
+    "MAMATA": 2.4608,
+    "MANAKALUCO": 6.5535,
+    "MANAKCOAT": 10.5834,
+    "MANAKSIA": 6.5534,
+    "MANALIPETC": 17.2,
+    "MANAPPURAM": 93.9336,
+    "MANBA": 5.0239,
+    "MANCREDIT": 2.1114,
+    "MANGLMCEM": 2.7497,
+    "MANINDS": 7.501,
+    "MANINFRA": 40.3666,
+    "MANKIND": 41.2909,
+    "MANOMAY": 1.8048,
+    "MANORAMA": 5.9709,
+    "MANUFGBEES": 0.0603,
+    "MANUGRAPH": 3.0415,
+    "MANYAVAR": 24.2973,
+    "MAPMYINDIA": 5.4761,
+    "MARATHON": 6.7421,
+    "MARICO": 129.8321,
+    "MARINE": 13.9944,
+    "MARKOLINES": 2.2041,
+    "MARKSANS": 45.3164,
+    "MARSONS": 17.21,
+    "MARUTI": 31.4403,
+    "MASFIN": 18.1453,
+    "MASPTOP50": 16.8623,
+    "MASTEK": 3.1001,
+    "MASTERTR": 12.3016,
+    "MATRIMONY": 2.0673,
+    "MAXESTATES": 16.3488,
+    "MAXHEALTH": 97.3244,
+    "MAXIND": 5.2523,
+    "MAYURUNIQ": 4.3453,
+    "MAZDA": 2.0025,
+    "MAZDOCK": 40.338,
+    "MBAPL": 8.7627,
+    "MBEL": 5.7148,
+    "MBLINFRA": 15.2529,
+    "MCCHRLS-B": 1.31,
+    "MCL": 2.7143,
+    "MCLOUD": 58.9067,
+    "MCX": 25.4992,
+    "MEDANTA": 26.8852,
+    "MEDIASSIST": 7.4702,
+    "MEDICAMEQ": 1.3563,
+    "MEDICO": 8.2983,
+    "MEDPLUS": 12.0055,
+    "MEESHO": 459.2697,
+    "MEGASTAR": 1.1294,
+    "MENNPIS": 5.0999,
+    "MENONBE": 5.604,
+    "MERCANTILE": 11.1918,
+    "METAL": 40.7954,
+    "METALIETF": 83.4124,
+    "METROBRAND": 27.2561,
+    "METROGLOBL": 1.2335,
+    "METROPOLIS": 20.7328,
+    "MFML": 1.0621,
+    "MFSL": 34.5115,
+    "MGEL": 32.9557,
+    "MGL": 9.8778,
+    "MHLXMIRU": 1.062,
+    "MHRIL": 20.2056,
+    "MICEL": 24.1011,
+    "MID150": 0.533,
+    "MID150BEES": 15.074,
+    "MID150CASE": 22.748,
+    "MIDCAP": 11.1366,
+    "MIDCAPADD": 0.2399,
+    "MIDCAPBETA": 0.0602,
+    "MIDCAPETF": 76.8519,
+    "MIDCAPIETF": 31.3931,
+    "MIDHANI": 18.734,
+    "MIDQ50ADD": 0.4032,
+    "MIDSELIETF": 5.7343,
+    "MIDSMALL": 8.9966,
+    "MIDWESTLTD": 3.6161,
+    "MINDACORP": 23.9079,
+    "MINDTECK": 3.1954,
+    "MIRZAINT": 13.8201,
+    "MITCON": 1.7418,
+    "MITTAL": 44.3939,
+    "MKPL": 37.5364,
+    "MMFL": 4.8282,
+    "MMP": 2.5403,
+    "MMTC": 150.0,
+    "MNC": 1.4254,
+    "MOALPHA50": 0.126,
+    "MOBANK10": 0.3452,
+    "MOBIKWIK": 7.873,
+    "MOCAPITAL": 4.155,
+    "MODEFENCE": 13.535,
+    "MODIRUBBER": 2.5041,
+    "MODIS": 1.9591,
+    "MODTHREAD": 3.4775,
+    "MOENERGY": 1.9519,
+    "MOGOLD": 11.9074,
+    "MOGSEC": 2.6111,
+    "MOHEALTH": 0.839,
+    "MOHITIND": 1.4157,
+    "MOIL": 20.3485,
+    "MOINFRA": 0.0505,
+    "MOIPO": 0.1201,
+    "MOKSH": 8.8251,
+    "MOL": 25.4313,
+    "MOLDTECH": 2.8805,
+    "MOLDTKPAC": 3.3229,
+    "MOLOWVOL": 1.7638,
+    "MOM100": 12.9154,
+    "MOM30IETF": 21.2762,
+    "MOM50": 0.2275,
+    "MOMENTUM": 1.4619,
+    "MOMENTUM30": 1.1762,
+    "MOMENTUM50": 6.941,
+    "MOMGF": 0.01,
+    "MOMIDMTM": 0.6264,
+    "MOMNC": 0.0751,
+    "MOMOMENTUM": 2.0346,
+    "MON100": 50.4135,
+    "MON50EQUAL": 3.9711,
+    "MONARCH": 7.9268,
+    "MONEXT50": 0.049,
+    "MONEYBOXX": 6.981,
+    "MONIFTY100": 0.592,
+    "MONIFTY500": 12.0299,
+    "MONQ50": 1.4675,
+    "MONTECARLO": 2.0732,
+    "MOPSE": 0.018,
+    "MOQUALITY": 0.129,
+    "MOREALTY": 3.5841,
+    "MOREPENLAB": 54.7955,
+    "MOSCHIP": 19.4133,
+    "MOSERVICE": 0.18,
+    "MOSILVER": 4.5415,
+    "MOSMALL250": 12.5797,
+    "MOTHERSON": 1055.4014,
+    "MOTILALOFS": 60.2045,
+    "MOTISONS": 98.446,
+    "MOTOUR": 0.3825,
+    "MOVALUE": 1.3997,
+    "MPHASIS": 19.0861,
+    "MPSLTD": 1.7106,
+    "MRF": 0.4241,
+    "MRPL": 175.2599,
+    "MSCI360": 0.6395,
+    "MSCIADD": 0.1128,
+    "MSCIINDIA": 53.8894,
+    "MSPL": 56.6798,
+    "MSTCLTD": 7.04,
+    "MSUMI": 663.1662,
+    "MTARTECH": 3.076,
+    "MTNL": 27.5622,
+    "MUFIN": 17.3232,
+    "MUFTI": 6.5394,
+    "MUKANDLTD": 14.4495,
+    "MUKKA": 30.0,
+    "MUKTAARTS": 2.2585,
+    "MULTICAP": 5.2287,
+    "MUNJALAU": 10.0,
+    "MUNJALSHOW": 3.9981,
+    "MURUDCERA": 6.0544,
+    "MUTHOOTCAP": 1.6448,
+    "MUTHOOTFIN": 40.1468,
+    "MUTHOOTMF": 17.0492,
+    "MVGJL": 4.8847,
+    "MWL": 2.9701,
+    "NACLIND": 23.4244,
+    "NAGREEKEXP": 3.1248,
+    "NAHARCAP": 1.6746,
+    "NAHARINDUS": 4.3206,
+    "NAHARPOLY": 2.4588,
+    "NAM-INDIA": 63.8483,
+    "NARMADA": 3.7937,
+    "NATCAPSUQ": 1.0386,
+    "NATCOPHARM": 17.911,
+    "NATHBIOGEN": 1.9004,
+    "NATIONALUM": 183.6632,
+    "NATIONSTD": 2.0,
+    "NAUKRI": 64.8421,
+    "NAVA": 28.3001,
+    "NAVINFLUOR": 5.1275,
+    "NAVKARCORP": 15.0519,
+    "NAVKARURB": 112.2083,
+    "NAVNETEDUL": 22.1213,
+    "NAZARA": 37.0465,
+    "NBCC": 270.0,
+    "NBIFIN": 0.2955,
+    "NCC": 62.7846,
+    "NCLIND": 4.5233,
+    "NDGL": 0.1,
+    "NDL": 144.1462,
+    "NDLVENTURE": 3.3672,
+    "NDRAUTO": 2.3785,
+    "NDTV": 11.2824,
+    "NECCLTD": 10.0,
+    "NELCAST": 8.7001,
+    "NELCO": 2.2818,
+    "NEOGEN": 2.7382,
+    "NEPHROPLUS": 10.0341,
+    "NESCO": 7.046,
+    "NESTLEIND": 192.8314,
+    "NETF": 2.7318,
+    "NETWEB": 5.6941,
+    "NETWORK18": 154.2001,
+    "NEULANDLAB": 1.283,
+    "NEWGEN": 14.2318,
+    "NEXT30ADD": 1.0841,
+    "NEXT50": 1.7996,
+    "NEXT50ADD": 0.1222,
+    "NEXT50BETA": 28.7967,
+    "NEXT50ETF": 0.2211,
+    "NEXT50IETF": 33.7716,
+    "NEXTMEDIA": 6.6897,
+    "NFL": 49.0579,
+    "NGLFINE": 0.6178,
+    "NH": 20.4361,
+    "NHPC": 1004.5035,
+    "NIACL": 164.8,
+    "NIBE": 1.4941,
+    "NIBL": 2.4229,
+    "NIF100BEES": 1.3287,
+    "NIF100IETF": 5.7058,
+    "NIFTY1": 12.8752,
+    "NIFTY100EW": 0.7845,
+    "NIFTYADD": 1.0952,
+    "NIFTYBEES": 236.6866,
+    "NIFTYBETA": 265.7602,
+    "NIFTYBETF": 0.7011,
+    "NIFTYCASE": 6.5791,
+    "NIFTYETF": 20.2721,
+    "NIFTYIETF": 154.2018,
+    "NIFTYQLITY": 1.2809,
+    "NIITLTD": 13.6517,
+    "NIITMTS": 13.7672,
+    "NILAINFRA": 39.3888,
+    "NILASPACES": 39.3889,
+    "NILE": 0.3002,
+    "NILKAMAL": 1.4923,
+    "NIPPOBATRY": 0.75,
+    "NIRAJISPAT": 0.06,
+    "NIRLON": 9.0118,
+    "NITCO": 24.0516,
+    "NITINSPIN": 5.622,
+    "NITIRAJ": 1.0251,
+    "NITTAGELA": 0.9079,
+    "NIVABUPA": 184.7457,
+    "NKIND": 0.601,
+    "NLCINDIA": 138.6637,
+    "NMDC": 879.1817,
+    "NOCIL": 16.7025,
+    "NORBTEAEXP": 1.5544,
+    "NORTHARC": 16.1572,
+    "NOVAAGRI": 9.2519,
+    "NOVARTIND": 2.4691,
+    "NPBET": 0.0481,
+    "NPST": 2.0851,
+    "NRAIL": 1.7019,
+    "NRBBEARING": 9.6923,
+    "NRL": 6.9069,
+    "NSIL": 0.5136,
+    "NSLNISP": 293.0607,
+    "NTPC": 969.6666,
+    "NTPCGREEN": 842.633,
+    "NUCLEUS": 2.6325,
+    "NURECA": 0.9542,
+    "NUVAMA": 18.2251,
+    "NUVOCO": 35.7156,
+    "NV20": 5.656,
+    "NV20BEES": 1.0705,
+    "NV20IETF": 12.9353,
+    "NYKAA": 286.3508,
+    "OAL": 3.3654,
+    "OBCL": 2.1083,
+    "OBEROIRLTY": 36.3602,
+    "OCCLLTD": 4.995,
+    "ODIGMA": 3.126,
+    "OFSS": 8.7064,
+    "OIL": 162.6608,
+    "OILIETF": 25.8855,
+    "OLAELEC": 441.0829,
+    "OLECTRA": 8.2081,
+    "OMAXE": 18.2901,
+    "OMFREIGHT": 3.3675,
+    "OMINFRAL": 9.6303,
+    "OMNI": 12.3666,
+    "OMPOWER": 3.4245,
+    "ONEPOINT": 26.2937,
+    "ONESOURCE": 11.4646,
+    "ONGC": 1258.0279,
+    "ONMOBILE": 10.6321,
+    "ONWARDTEC": 2.2761,
+    "OPTIEMUS": 8.8689,
+    "ORBTEXP": 2.6511,
+    "ORCHASP": 34.6422,
+    "ORCHPHARMA": 5.0719,
+    "ORICONENT": 15.7048,
+    "ORIENTALTL": 7.35,
+    "ORIENTBELL": 1.4711,
+    "ORIENTCEM": 20.546,
+    "ORIENTCER": 11.9639,
+    "ORIENTELEC": 21.3366,
+    "ORIENTHOT": 17.8599,
+    "ORIENTLTD": 1.0,
+    "ORIENTPPR": 21.2183,
+    "ORIENTTECH": 4.5806,
+    "ORISSAMINE": 0.6,
+    "ORKLAINDIA": 13.6989,
+    "ORTINGLOBE": 0.813,
+    "OSWALGREEN": 25.6811,
+    "OSWALPUMPS": 11.4005,
+    "OSWALSEEDS": 9.1468,
+    "PACEDIGITK": 21.5851,
+    "PAGEIND": 1.1154,
+    "PAISALO": 90.9522,
+    "PAKKA": 4.4948,
+    "PALASHSECU": 1.0003,
+    "PANACEABIO": 6.1251,
+    "PANACHE": 1.6014,
+    "PANAMAPET": 6.0494,
+    "PANSARI": 1.7447,
+    "PAR": 1.2305,
+    "PARACABLES": 30.521,
+    "PARADEEP": 103.817,
+    "PARAGMILK": 12.511,
+    "PARAS": 8.0587,
+    "PARASPETRO": 33.42,
+    "PARKHOSPS": 43.1931,
+    "PARKHOTELS": 21.3374,
+    "PASHUPATI": 15.784,
+    "PASUPTAC": 8.9133,
+    "PATANJALI": 108.8109,
+    "PATELENG": 99.214,
+    "PATELRMART": 3.3401,
+    "PATINTLOG": 6.9588,
+    "PAUSHAKLTD": 2.4657,
+    "PAYTM": 64.018,
+    "PCBL": 39.3463,
+    "PCJEWELLER": 801.6753,
+    "PDMJEPAPER": 9.4951,
+    "PDSL": 14.1442,
+    "PENIND": 13.4946,
+    "PERSISTENT": 15.775,
+    "PETRONET": 150.0,
+    "PFC": 330.0102,
+    "PFIZER": 4.5748,
+    "PFS": 64.2282,
+    "PGEL": 28.5343,
+    "PGHH": 3.2461,
+    "PGHL": 1.6599,
+    "PGIL": 4.618,
+    "PHARMABEES": 63.5982,
+    "PHOENIXLTD": 35.7641,
+    "PICCADIL": 9.8572,
+    "PIDILITIND": 101.7775,
+    "PIGL": 2.0679,
+    "PIIND": 15.1718,
+    "PILANIINVS": 1.1072,
+    "PINELABS": 114.8276,
+    "PIONEEREMB": 3.0808,
+    "PIONRINV": 1.2297,
+    "PIRAMALFIN": 22.6678,
+    "PITTIENG": 3.7654,
+    "PIXTRANS": 1.3625,
+    "PKTEA": 0.3096,
+    "PLASTIBLEN": 2.5989,
+    "PLATIND": 5.4925,
+    "PML": 0.3084,
+    "PNB": 1149.2944,
+    "PNBGILTS": 18.001,
+    "PNBHOUSING": 26.059,
+    "PNC": 1.4469,
+    "PNCINFRA": 25.6539,
+    "PNGJL": 13.5708,
+    "PNGSREVA": 3.1698,
+    "POCL": 3.0511,
+    "PODDARMENT": 1.061,
+    "POKARNA": 3.1004,
+    "POLICYBZR": 46.2693,
+    "POLYCAB": 15.0584,
+    "POLYMED": 10.136,
+    "POLYPLEX": 3.1392,
+    "PONNIERODE": 0.8598,
+    "POONAWALLA": 88.048,
+    "POWERGRID": 930.0604,
+    "POWERICA": 12.6552,
+    "POWERINDIA": 4.4572,
+    "POWERMECH": 3.1616,
+    "PPAP": 1.4153,
+    "PPL": 2.3919,
+    "PPLPHARMA": 132.9248,
+    "PRABHA": 13.6906,
+    "PRADPME": 1.727,
+    "PRAENG": 6.9937,
+    "PRAJIND": 18.3813,
+    "PRAKASH": 17.9082,
+    "PRAKASHSTL": 17.5,
+    "PRAVEG": 2.6141,
+    "PRECAM": 9.4986,
+    "PRECOT": 1.2,
+    "PRECWIRE": 18.2808,
+    "PREMCO": 0.3305,
+    "PREMEXPLN": 5.3761,
+    "PREMIERENE": 45.2994,
+    "PRESTIGE": 43.073,
+    "PRICOLLTD": 12.1882,
+    "PRIMESECU": 3.39,
+    "PRIMO": 24.2344,
+    "PRINCEPIPE": 11.0561,
+    "PRITI": 1.3353,
+    "PRITIKAUTO": 16.6511,
+    "PRIVISCL": 3.9063,
+    "PROSTARM": 5.8874,
+    "PROTEAN": 4.0617,
+    "PROZONER": 15.2602,
+    "PRSMJOHNSN": 50.3357,
+    "PRUDENT": 4.1407,
+    "PRUDMOULI": 3.2255,
+    "PSB": 709.5587,
+    "PSPPROJECT": 3.9642,
+    "PSUBANK": 2.5252,
+    "PSUBANKADD": 3.9772,
+    "PSUBNKBEES": 44.5525,
+    "PSUBNKIETF": 1.5426,
+    "PTC": 29.6008,
+    "PTCIL": 1.4993,
+    "PTL": 13.2376,
+    "PUNJABCHEM": 1.2262,
+    "PURVA": 23.715,
+    "PVP": 26.0403,
+    "PVRINOX": 9.82,
+    "PVSL": 7.1198,
+    "PVTBANIETF": 119.0064,
+    "PVTBANKADD": 21.9613,
+    "PVTBKGROWW": 0.2264,
+    "PWL": 288.86,
+    "PYRAMID": 3.6785,
+    "QGOLDHALF": 5.86,
+    "QNIFTY": 0.2392,
+    "QUADFUTURE": 4.0,
+    "QUAL30IETF": 6.8946,
+    "QUALITY30": 0.1265,
+    "QUESS": 14.9331,
+    "QUINT": 4.7208,
+    "RACLGEAR": 1.1788,
+    "RADAAN": 5.4153,
+    "RADHIKAJWE": 11.8001,
+    "RADIANTCMS": 10.6707,
+    "RADICO": 13.3931,
+    "RADIOCITY": 34.5689,
+    "RAILTEL": 32.0938,
+    "RAIN": 33.6346,
+    "RAINBOW": 10.1559,
+    "RAJMET": 27.6484,
+    "RAJOOENG": 17.8675,
+    "RAJPALAYAM": 0.922,
+    "RAJRATAN": 5.0771,
+    "RAJSREESUG": 3.3137,
+    "RAJTV": 5.1914,
+    "RALLIS": 19.4469,
+    "RAMANEWS": 14.7523,
+    "RAMAPHO": 3.5387,
+    "RAMASTEEL": 163.5506,
+    "RAMCOCEM": 23.6292,
+    "RAMCOIND": 8.6842,
+    "RAMCOSYS": 3.7559,
+    "RAMKY": 6.9198,
+    "RAMRAT": 9.3349,
+    "RANASUG": 15.3564,
+    "RANEHOLDIN": 1.4278,
+    "RATEGAIN": 11.8165,
+    "RATNAMANI": 7.0092,
+    "RATNAVEER": 6.787,
+    "RAYMOND": 6.6574,
+    "RAYMONDLSL": 6.0924,
+    "RAYMONDREL": 6.6574,
+    "RBA": 58.2876,
+    "RBLBANK": 61.9138,
+    "RBZJEWEL": 4.0,
+    "RCF": 55.1688,
+    "RECLTD": 263.3224,
+    "REDINGTON": 78.1774,
+    "REDTAPE": 55.2807,
+    "REFEX": 13.722,
+    "REGENCERAM": 2.6441,
+    "RELAXO": 24.8939,
+    "RELCHEMQ": 0.7543,
+    "RELIABLE": 1.032,
+    "RELIANCE": 1353.2539,
+    "RELIGARE": 33.289,
+    "RELTD": 17.8694,
+    "REMSONSIND": 3.4879,
+    "RENUKA": 212.8488,
+    "REPCOHOME": 6.2561,
+    "REPL": 1.8122,
+    "REPRO": 1.4345,
+    "RESPONIND": 26.6608,
+    "RETAIL": 0.8205,
+    "RGL": 10.7334,
+    "RHETAN": 79.6875,
+    "RHIM": 20.6501,
+    "RHL": 1.7291,
+    "RICOAUTO": 13.5285,
+    "RIIL": 1.51,
+    "RISHABH": 3.8552,
+    "RITCO": 2.8623,
+    "RITES": 48.0604,
+    "RKDL": 2.4,
+    "RKEC": 2.5821,
+    "RKFORGE": 18.1031,
+    "RKSWAMY": 5.0477,
+    "RMDRIP": 42.8229,
+    "RML": 2.7637,
+    "RNBDENIMS": 26.9921,
+    "ROHLTD": 2.7425,
+    "ROLEXRINGS": 27.2333,
+    "ROML": 1.4989,
+    "ROSSARI": 5.5392,
+    "ROSSELLIND": 3.7697,
+    "ROSSTECH": 3.7696,
+    "ROTO": 18.8446,
+    "ROUTE": 6.3003,
+    "RPEL": 4.5922,
+    "RPGLIFE": 1.6539,
+    "RPOWER": 413.5771,
+    "RPPINFRA": 4.9586,
+    "RPPL": 7.4245,
+    "RPSGVENT": 3.3086,
+    "RPTECH": 6.59,
+    "RRIL": 12.1213,
+    "RRKABEL": 11.3105,
+    "RSDFIN": 1.2946,
+    "RSL": 8.3567,
+    "RSWM": 4.7101,
+    "RSYSTEMS": 11.8487,
+    "RTNINDIA": 138.2271,
+    "RTNPOWER": 537.0103,
+    "RUBFILA": 5.4268,
+    "RUBICON": 16.5092,
+    "RUBYMILLS": 3.344,
+    "RUCHINFRA": 23.6032,
+    "RUCHIRA": 2.9845,
+    "RUPA": 7.9525,
+    "RUSHIL": 29.3415,
+    "RUSTOMJEE": 12.624,
+    "RVHL": 6.1326,
+    "RVNL": 208.502,
+    "RVTH": 0.3067,
+    "SAATVIKGL": 12.7105,
+    "SADBHAV": 17.1571,
+    "SADBHIN": 35.223,
+    "SAFARI": 4.8996,
+    "SAGARDEEP": 1.7058,
+    "SAGCEM": 13.0707,
+    "SAGILITY": 468.1329,
+    "SAHLIBHFI": 3.0888,
+    "SAHYADRI": 1.0946,
+    "SAIL": 413.0525,
+    "SAILIFE": 21.2116,
+    "SAIPARENT": 4.4179,
+    "SAKAR": 2.225,
+    "SAKHTISUG": 11.8851,
+    "SAKSOFT": 13.2551,
+    "SALASAR": 174.7957,
+    "SALONA": 0.5262,
+    "SALZERELEC": 1.7683,
+    "SAMBHAAV": 19.1116,
+    "SAMBHV": 29.4671,
+    "SAMHI": 22.2135,
+    "SAMMAANCAP": 115.8856,
+    "SAMPANN": 4.8809,
+    "SANATHAN": 8.4404,
+    "SANDESH": 0.7569,
+    "SANDHAR": 6.0191,
+    "SANDUMA": 48.6105,
+    "SANGAMIND": 5.0247,
+    "SANGHVIMOV": 8.6576,
+    "SANOFI": 2.3031,
+    "SANOFICONR": 2.3031,
+    "SANSERA": 6.2332,
+    "SANSTAR": 18.2244,
+    "SAPPHIRE": 32.1383,
+    "SAPPL": 0.8851,
+    "SARDAEN": 35.2381,
+    "SAREGAMA": 19.2809,
+    "SARLAPOLY": 8.3503,
+    "SASKEN": 1.5186,
+    "SATIA": 10.0,
+    "SATIN": 11.0471,
+    "SAURASHCEM": 11.1287,
+    "SAYAJIHOTL": 1.7518,
+    "SBC": 47.619,
+    "SBCL": 5.7604,
+    "SBFC": 110.6681,
+    "SBGLP": 17.3415,
+    "SBIBPB": 14.8623,
+    "SBICARD": 95.1605,
+    "SBIETFCON": 0.1968,
+    "SBIETFIT": 0.2364,
+    "SBIETFPB": 1.4927,
+    "SBIETFQLTY": 0.3604,
+    "SBILIFE": 100.3172,
+    "SBILIQETF": 0.0534,
+    "SBIMIDMOM": 0.1527,
+    "SBIN": 923.0618,
+    "SBINEQWETF": 1.1693,
+    "SBINMID150": 0.5193,
+    "SBISILVER": 25.1251,
+    "SBISMLETF": 0.3775,
+    "SBIVALETF": 0.379,
+    "SCANSTL": 5.8603,
+    "SCHAEFFLER": 15.6304,
+    "SCHAND": 3.5272,
+    "SCHNEIDER": 23.9104,
+    "SCI": 46.5799,
+    "SCILAL": 46.58,
+    "SCODATUBES": 5.9909,
+    "SDBL": 19.7276,
+    "SEAMECLTD": 2.5425,
+    "SECMARK": 1.0447,
+    "SECURKLOUD": 3.341,
+    "SEDEMAC": 4.4161,
+    "SEIL": 16.1,
+    "SELECTIPO": 0.4482,
+    "SELMC": 3.3133,
+    "SENCO": 16.3839,
+    "SENORES": 4.6054,
+    "SENSEXADD": 0.0483,
+    "SENSEXBETA": 64.4345,
+    "SENSEXETF": 0.5646,
+    "SENSEXIETF": 34.0171,
+    "SEPC": 189.3261,
+    "SERVOTECH": 22.5845,
+    "SESHAPAPER": 6.3068,
+    "SETF10GILT": 12.4814,
+    "SETFGOLD": 193.3083,
+    "SETFNIF50": 815.9154,
+    "SETFNIFBK": 6.5815,
+    "SETFNN50": 3.8168,
+    "SETL": 19.9492,
+    "SFL": 10.9199,
+    "SGFIN": 5.5895,
+    "SGIL": 1.5543,
+    "SGL": 2.6991,
+    "SGMART": 12.6,
+    "SHADOWFAX": 58.4752,
+    "SHAH": 88.5214,
+    "SHAHALLOYS": 1.9797,
+    "SHAILY": 4.5955,
+    "SHAKTIPUMP": 12.3398,
+    "SHALBY": 10.801,
+    "SHALPAINTS": 8.3711,
+    "SHANTI": 1.1102,
+    "SHANTIGEAR": 7.6716,
+    "SHANTIGOLD": 7.2096,
+    "SHARDACROP": 9.022,
+    "SHARDAMOTR": 5.7408,
+    "SHARDUL": 8.7491,
+    "SHAREINDIA": 21.7492,
+    "SHARIABEES": 0.1213,
+    "SHBAJRG": 0.9,
+    "SHEMAROO": 2.8731,
+    "SHILCTECH": 1.144,
+    "SHILPAMED": 19.5582,
+    "SHINDL": 3.9214,
+    "SHIVATEX": 1.2963,
+    "SHIVAUM": 1.36,
+    "SHK": 13.8421,
+    "SHOPERSTOP": 11.0125,
+    "SHRADHA": 8.0999,
+    "SHREDIGCEM": 14.7869,
+    "SHREECEM": 3.6081,
+    "SHREEJISPG": 16.2918,
+    "SHREEPUSHK": 3.2338,
+    "SHREERAMA": 13.3469,
+    "SHREYANIND": 1.3825,
+    "SHRIKRISH": 2.8,
+    "SHRINGARMS": 9.6432,
+    "SHRIPISTON": 4.405,
+    "SHRIRAMFIN": 235.2831,
+    "SHRIRAMPPS": 17.0655,
+    "SHYAMCENT": 21.2164,
+    "SHYAMMETL": 27.9132,
+    "SICAGEN": 3.9572,
+    "SIEMENS": 35.6121,
+    "SIGIND": 2.9436,
+    "SIGMA": 10.2774,
+    "SIGNATURE": 14.0511,
+    "SIGNPOST": 5.345,
+    "SIKA": 2.1201,
+    "SIKKO": 43.6789,
+    "SIL": 6.4326,
+    "SILGO": 3.929,
+    "SILINV": 1.0596,
+    "SILLYMONKS": 1.2459,
+    "SILVER": 12.6684,
+    "SILVER1": 152.1315,
+    "SILVER360": 0.1886,
+    "SILVERADD": 7.3574,
+    "SILVERAG": 4.5453,
+    "SILVERBEES": 131.8351,
+    "SILVERBETA": 5.8783,
+    "SILVERBND": 0.0527,
+    "SILVERCASE": 47.3659,
+    "SILVERIETF": 61.2029,
+    "SILVERTUC": 12.681,
+    "SIMPLEXINF": 7.9095,
+    "SINCLAIR": 5.126,
+    "SINDHUTRAD": 154.1927,
+    "SINGERIND": 6.2219,
+    "SINTERCOM": 2.7527,
+    "SIRCA": 5.6793,
+    "SIS": 14.1295,
+    "SIYSIL": 4.537,
+    "SJS": 3.1997,
+    "SJVN": 392.9795,
+    "SKFINDIA": 4.9438,
+    "SKFINDUS": 4.9438,
+    "SKIPPER": 11.2904,
+    "SKMEGGPROD": 5.266,
+    "SKYGOLD": 15.4874,
+    "SMALL250": 4.0743,
+    "SMALLADD": 0.3112,
+    "SMALLCAP": 20.3977,
+    "SMARTWORKS": 11.4262,
+    "SMCGLOBAL": 20.94,
+    "SML100CASE": 7.9182,
+    "SMLMAH": 1.4472,
+    "SMLT": 1.3689,
+    "SMSPHARMA": 9.3652,
+    "SNOWMAN": 16.7089,
+    "SNXT30BEES": 0.1494,
+    "SNXT50BETA": 0.3565,
+    "SOBHA": 10.6933,
+    "SOLARA": 4.771,
+    "SOLARINDS": 9.049,
+    "SOLARWORLD": 8.6673,
+    "SOLEX": 1.0803,
+    "SOMANYCERA": 4.1013,
+    "SOMATEX": 3.3033,
+    "SOMICONVEY": 1.1779,
+    "SONACOMS": 62.2028,
+    "SONAL": 1.4739,
+    "SONAMLTD": 4.0031,
+    "SONATSOFTW": 28.0425,
+    "SOTL": 6.856,
+    "SOUTHBANK": 261.7618,
+    "SOUTHWEST": 2.983,
+    "SPAL": 2.5139,
+    "SPANDANA": 7.1305,
+    "SPARC": 32.45,
+    "SPCENET": 56.7747,
+    "SPECIALITY": 4.8235,
+    "SPECTRUM": 1.5714,
+    "SPENCERS": 9.0131,
+    "SPIC": 20.3641,
+    "SPLIL": 2.9,
+    "SPLPETRO": 18.8041,
+    "SPMLINFRA": 7.8821,
+    "SPORTKING": 12.7072,
+    "SRD": 6.3966,
+    "SREEL": 2.3155,
+    "SRF": 29.6425,
+    "SRGHFL": 1.5706,
+    "SRHHYPOLTD": 1.7165,
+    "SRM": 2.2944,
+    "SRTL": 3.9976,
+    "SSDL": 3.96,
+    "SSWL": 15.718,
+    "STALLION": 11.6086,
+    "STANLEY": 5.7126,
+    "STAR": 9.2173,
+    "STARCEMENT": 41.2429,
+    "STARHEALTH": 58.8404,
+    "STARPAPER": 1.5609,
+    "STARTECK": 0.991,
+    "STCINDIA": 6.0,
+    "STEELCAS": 10.12,
+    "STEELCITY": 1.5108,
+    "STEELXIND": 124.7223,
+    "STEL": 1.8455,
+    "STERTOOLS": 3.6344,
+    "STOVEKRAFT": 3.3107,
+    "STUDDS": 3.9353,
+    "STYL": 16.1806,
+    "STYLAMIND": 1.6948,
+    "STYRENIX": 1.7586,
+    "SUBROS": 6.5236,
+    "SUDARCOLOR": 2.3082,
+    "SUDARSCHEM": 7.8628,
+    "SUDEEPPHRM": 11.2949,
+    "SUKHJITS": 3.1244,
+    "SULA": 8.4447,
+    "SUMEETINDS": 52.6324,
+    "SUMICHEM": 49.9146,
+    "SUMMITSEC": 1.0902,
+    "SUNCLAY": 2.2046,
+    "SUNDARAM": 47.3885,
+    "SUNDARMFIN": 11.1104,
+    "SUNDRMBRAK": 0.3935,
+    "SUNDRMFAST": 21.0128,
+    "SUNDROP": 3.7697,
+    "SUNFLAG": 18.0219,
+    "SUNPHARMA": 239.9278,
+    "SUNTECK": 14.6842,
+    "SUNTV": 39.4085,
+    "SUPERHOUSE": 1.1025,
+    "SUPERSPIN": 5.5,
+    "SUPRAJIT": 13.7171,
+    "SUPREME": 3.8647,
+    "SUPREMEIND": 12.7027,
+    "SUPREMEINF": 9.6735,
+    "SUPRIYA": 8.0483,
+    "SURAJEST": 4.7774,
+    "SURAJLTD": 1.8364,
+    "SURAKSHA": 5.2081,
+    "SURANASOL": 4.9205,
+    "SURANAT&P": 13.576,
+    "SURYALA": 0.4267,
+    "SURYALAXMI": 1.8804,
+    "SURYAROSNI": 21.7636,
+    "SURYODAY": 10.629,
+    "SUTLEJTEX": 16.383,
+    "SUVEN": 26.3721,
+    "SUVIDHAA": 20.9816,
+    "SUYOG": 1.1717,
+    "SUZLON": 1371.5486,
+    "SVLL": 1.1494,
+    "SWANCORP": 31.3457,
+    "SWARAJENG": 1.215,
+    "SWELECTES": 1.5159,
+    "SWIGGY": 276.0314,
+    "SWSOLAR": 23.3532,
+    "SYMPHONY": 6.8671,
+    "SYNCOMF": 94.0,
+    "SYNGENE": 40.3669,
+    "SYRMA": 19.2831,
+    "SYSTMTXC": 13.6537,
+    "TAALTECH": 0.3116,
+    "TAINWALCHM": 0.9364,
+    "TAJGVK": 6.2702,
+    "TALBROAUTO": 6.1728,
+    "TAMBOLIIN": 0.992,
+    "TANLA": 13.2617,
+    "TARACHAND": 7.8826,
+    "TARAPUR": 1.9502,
+    "TARC": 29.5097,
+    "TARIL": 30.0166,
+    "TARMAT": 2.5065,
+    "TARSONS": 5.3206,
+    "TASTYBITE": 0.2566,
+    "TATACAP": 424.4869,
+    "TATACHEM": 25.4756,
+    "TATACOMM": 28.5,
+    "TATACONSUM": 98.9177,
+    "TATAELXSI": 6.2259,
+    "TATAGOLD": 386.3632,
+    "TATAINVEST": 50.5951,
+    "TATAPOWER": 319.534,
+    "TATASTEEL": 1248.3527,
+    "TATATECH": 40.6052,
+    "TATSILV": 217.7051,
+    "TATVA": 2.3392,
+    "TBOTEK": 10.8588,
+    "TBZ": 6.673,
+    "TCC": 4.7528,
+    "TCI": 7.6744,
+    "TCIEXP": 3.8419,
+    "TCIFINANCE": 1.2876,
+    "TCPLPACK": 0.91,
+    "TCS": 361.8088,
+    "TDPOWERSYS": 15.6228,
+    "TEAMGTY": 0.8993,
+    "TEAMLEASE": 1.6769,
+    "TECH": 1.3244,
+    "TECHM": 97.9954,
+    "TECHNOE": 11.63,
+    "TECHNVISN": 0.6275,
+    "TECILCHEM": 1.8968,
+    "TEGA": 7.5128,
+    "TEJASNET": 17.778,
+    "TEMBO": 1.8545,
+    "TENNIND": 40.3604,
+    "TERASOFT": 1.2512,
+    "TEXINFRA": 12.7427,
+    "TEXMOPIPES": 2.9196,
+    "TEXRAIL": 40.6865,
+    "TFCILTD": 46.2977,
+    "TFL": 5.5112,
+    "TGBHOTELS": 2.9281,
+    "THACKER": 0.1088,
+    "THAKDEV": 0.9,
+    "THANGAMAYL": 3.1082,
+    "THEINVEST": 5.2243,
+    "THEJO": 1.0847,
+    "THELEELA": 33.3958,
+    "THEMISMED": 9.21,
+    "THERMAX": 11.9156,
+    "THOMASCOOK": 47.0381,
+    "THOMASCOTT": 1.467,
+    "THYROCARE": 15.9165,
+    "TI": 24.7171,
+    "TICL": 15.5,
+    "TIIL": 2.2673,
+    "TIINDIA": 19.3562,
+    "TIJARIA": 2.8631,
+    "TIL": 7.0352,
+    "TIMETECHNO": 49.3636,
+    "TIMEX": 10.095,
+    "TIMKEN": 7.5219,
+    "TINNARUBR": 1.8016,
+    "TIPSFILMS": 0.4323,
+    "TIPSMUSIC": 12.7832,
+    "TIRUMALCHM": 12.0553,
+    "TITAGARH": 13.4674,
+    "TITAN": 88.7786,
+    "TMB": 15.8351,
+    "TMCV": 368.2489,
+    "TMPV": 368.2684,
+    "TNIDETF": 2.0346,
+    "TNPETRO": 8.9971,
+    "TNPL": 6.9211,
+    "TNTELE": 4.567,
+    "TOLINS": 3.9508,
+    "TOP100CASE": 15.0663,
+    "TOP10ADD": 8.4448,
+    "TOP15IETF": 1.431,
+    "TOP20": 1.4287,
+    "TORNTPHARM": 33.8436,
+    "TORNTPOWER": 50.3904,
+    "TOTAL": 1.6127,
+    "TOUCHWOOD": 1.1081,
+    "TPHQ": 109.62,
+    "TPLPLASTEH": 7.8003,
+    "TRACXN": 10.6802,
+    "TRANSPEK": 0.5586,
+    "TRANSRAILL": 13.4256,
+    "TRANSWORLD": 2.1958,
+    "TRAVELFOOD": 13.1679,
+    "TREEHOUSE": 4.2304,
+    "TREJHARA": 2.4117,
+    "TREL": 24.5695,
+    "TRENT": 35.5488,
+    "TRF": 1.1004,
+    "TRIDENT": 509.5955,
+    "TRIGYN": 3.0786,
+    "TRITURBINE": 31.7895,
+    "TRIVENI": 21.8898,
+    "TRU": 11.8858,
+    "TRUALT": 8.5753,
+    "TSFINV": 22.2104,
+    "TTKHLTCARE": 1.413,
+    "TTKPRESTIG": 13.6951,
+    "TTL": 25.8306,
+    "TTML": 195.4929,
+    "TVSELECT": 1.865,
+    "TVSHLTD": 2.0232,
+    "TVSMOTOR": 47.5087,
+    "TVSSCS": 44.118,
+    "TVSSRICHAK": 0.7657,
+    "TVTODAY": 5.9669,
+    "TVVISION": 3.8736,
+    "TWCGOLDETF": 0.1585,
+    "UBL": 26.4405,
+    "UCAL": 2.2113,
+    "UCOBANK": 1253.9558,
+    "UDS": 6.6953,
+    "UEL": 13.3398,
+    "UFBL": 3.9086,
+    "UFLEX": 7.2212,
+    "UFO": 3.8814,
+    "UGARSUGAR": 11.25,
+    "UGROCAP": 15.5288,
+    "UJJIVANSFB": 194.4441,
+    "ULTRACEMCO": 29.4679,
+    "ULTRAMAR": 2.92,
+    "UMAEXPORTS": 3.3811,
+    "UMIYA-MRO": 1.8685,
+    "UNICHEMLAB": 7.0406,
+    "UNIDT": 2.0303,
+    "UNIECOM": 11.2379,
+    "UNIENTER": 6.9546,
+    "UNIMECH": 5.0857,
+    "UNIONBANK": 763.3606,
+    "UNIONGOLD": 2.1459,
+    "UNIPARTS": 4.5143,
+    "UNITDSPR": 72.7351,
+    "UNITECH": 261.4644,
+    "UNITEDTEA": 0.4997,
+    "UNIVASTU": 3.5987,
+    "UNIVCABLES": 3.4695,
+    "UNOMINDA": 57.7456,
+    "UPL": 84.4169,
+    "URAVIDEF": 1.14,
+    "URBANCO": 154.218,
+    "URJA": 52.5451,
+    "USHAMART": 30.4742,
+    "USK": 5.5358,
+    "UTIAMC": 12.8523,
+    "UTKARSHBNK": 177.9527,
+    "UTLSOLAR": 30.6902,
+    "UTTAMSUGAR": 3.8138,
+    "UYFINCORP": 19.024,
+    "V2RETAIL": 36.4638,
+    "VADILALIND": 0.7188,
+    "VAIBHAVGBL": 16.7261,
+    "VAKRANGEE": 108.3199,
+    "VAL30IETF": 3.3475,
+    "VALIANTORG": 2.802,
+    "VALUE": 0.7681,
+    "VARDHACRLC": 8.0364,
+    "VARROC": 15.2786,
+    "VASWANI": 3.2947,
+    "VBL": 338.2296,
+    "VCL": 18.3723,
+    "VEDL": 391.0388,
+    "VEEDOL": 1.7424,
+    "VELJAN": 0.45,
+    "VENKEYS": 1.4087,
+    "VENTIVE": 23.3542,
+    "VENUSPIPES": 2.0716,
+    "VENUSREM": 1.3367,
+    "VERANDA": 9.6321,
+    "VESUVIUS": 20.2961,
+    "VETO": 1.9115,
+    "VGL": 5.1528,
+    "VGUARD": 43.6891,
+    "VHL": 0.3192,
+    "VIDHIING": 4.9945,
+    "VIDYAWIRES": 21.2693,
+    "VIJAYA": 10.2725,
+    "VIKASECO": 176.8702,
+    "VIKASLIFE": 185.7651,
+    "VIKRAMSOLR": 36.233,
+    "VIKRAN": 25.791,
+    "VIMTALABS": 4.4669,
+    "VINATIORGA": 10.3666,
+    "VINCOFE": 14.5688,
+    "VINDHYATEL": 1.1851,
+    "VINNY": 46.5278,
+    "VINYLINDIA": 1.8337,
+    "VIPIND": 14.2052,
+    "VIPULLTD": 14.0957,
+    "VIRINCHI": 10.8795,
+    "VISAKAIND": 8.6404,
+    "VISHNU": 6.7315,
+    "VISHWARAJ": 21.7826,
+    "VIVIDHA": 29.2679,
+    "VIYASH": 43.6876,
+    "VLSFINANCE": 3.1379,
+    "VMART": 7.9548,
+    "VMM": 467.6375,
+    "VOLTAMP": 1.0117,
+    "VOLTAS": 33.0885,
+    "VRAJ": 3.2982,
+    "VRLLOG": 17.4937,
+    "VSSL": 9.6686,
+    "VSTIND": 16.9861,
+    "VSTL": 1.8963,
+    "VSTTILLERS": 0.8653,
+    "VTL": 28.9282,
+    "WAAREEENER": 28.7651,
+    "WAAREEINDO": 4.1604,
+    "WAAREERTL": 10.4346,
+    "WABAG": 6.2316,
+    "WAKEFIT": 33.1332,
+    "WALCHANNAG": 6.7842,
+    "WANBURY": 3.494,
+    "WCIL": 10.1955,
+    "WEALTH": 1.0655,
+    "WEBELSOLAR": 43.4163,
+    "WEIZMANIND": 1.5493,
+    "WEL": 13.4008,
+    "WELCORP": 26.3791,
+    "WELENT": 13.8414,
+    "WELSPLSOL": 66.2611,
+    "WELSPUNLIV": 95.9153,
+    "WENDT": 0.2,
+    "WESTLIFE": 15.5644,
+    "WEWORK": 13.7194,
+    "WHEELS": 2.4433,
+    "WHIRLPOOL": 12.6872,
+    "WILLAMAGOR": 1.0955,
+    "WIMPLAST": 1.2003,
+    "WINDLAS": 2.1106,
+    "WINDMACHIN": 8.7822,
+    "WIPL": 0.8487,
+    "WIPRO": 1050.2271,
+    "WOCKPHARMA": 16.2486,
+    "WONDERLA": 6.3423,
+    "WORTHPERI": 1.5751,
+    "WPIL": 9.7671,
+    "WSI": 7.5895,
+    "WSTCSTPAPR": 6.6049,
+    "XCHANGING": 11.1404,
+    "XELPMOC": 1.48,
+    "XPROINDIA": 2.347,
+    "XTGLOBAL": 13.4122,
+    "YASHO": 1.2057,
+    "YATHARTH": 9.6354,
+    "YATRA": 15.6916,
+    "YESBANK": 3138.5531,
+    "YUKEN": 1.3584,
+    "ZAGGLE": 13.4458,
+    "ZEEL": 96.052,
+    "ZEELEARN": 32.7058,
+    "ZEEMEDIA": 62.5432,
+    "ZENITHEXPO": 0.5396,
+    "ZENITHSTL": 14.2275,
+    "ZENSARTECH": 22.7496,
+    "ZENTEC": 9.029,
+    "ZFCVINDIA": 1.8968,
+    "ZFSTEERING": 0.9073,
+    "ZODIACLOTH": 2.7459,
+    "ZOTA": 3.4633,
+    "ZSARACOM": 0.1096,
+    "ZUARI": 4.2058,
+    "ZUARIIND": 2.9781,
+    "ZYDUSLIFE": 100.6234,
+    "ZYDUSWELL": 31.8161,
+}
+
+
+def push_github(text):
+    if not PAT: return False
+    url = f"https://api.github.com/repos/{GUSER}/{GREPO}/contents/{GPATH}"
+    h   = {"Authorization":f"token {PAT}","Accept":"application/vnd.github.v3+json"}
+    sha = None
+    try:
+        r = requests.get(url,headers=h,timeout=15)
+        if r.status_code==200: sha=r.json().get("sha")
+    except: pass
+    body = {"message":f"scan {datetime.now():%Y-%m-%d %H:%M}",
+            "content":base64.b64encode(text.encode()).decode(),"branch":"main"}
+    if sha: body["sha"]=sha
+    try:
+        r = requests.put(url,headers=h,json=body,timeout=30)
+        ok = r.status_code in(200,201)
+        print(f"  GitHub {'OK' if ok else 'FAIL'} ({r.status_code})")
+        return ok
+    except Exception as e:
+        print(f"  GitHub error: {e}"); return False
+
+def trdates(n):
+    out,d=[],datetime.now()
+    while len(out)<n:
+        d-=timedelta(days=1)
+        if d.weekday()<5: out.append(d)
+    return out
+
+def dma200_score(ltp, s200, s200_rising):
+    """
+    200DMA Distance Score for S2 (0-15 pts).
+    Replaces old binary ma×5 check introduced in 18.3.
+
+    Zones and rationale:
+      0-2%:  5 pts  — possible re-entry but not confirmed; direction unclear
+      2-10%: 15 pts — ideal early zone, best risk/reward for institutional entry
+     10-20%: 13 pts — healthy institutional trend
+     20-35%: 11 pts — mature uptrend, historically validated
+                       (HAL +24%→+200%, CG Power +34%→+627%, KPIT +33%→+673%)
+     35-50%:  8 pts — extended but valid
+      >50%:   5 pts — momentum territory, past institutional accumulation phase
+     Falling 200DMA: cap at 6 pts (declining 200DMA = distribution in progress)
+     Below 0%: 0 pts (downtrend)
+
+    Stepped gradient (not flat) preserves entry quality distinction:
+      Stock at 3% above 200DMA = 5.7% drawdown risk to 200DMA
+      Stock at 24% above 200DMA = 19.4% drawdown risk to 200DMA
+    """
+    if ltp is None or s200 is None or s200 <= 0: return 0
+    pct = (ltp - s200) / s200 * 100
+    if   pct < 0:    score = 0
+    elif pct <= 2:   score = 5
+    elif pct <= 10:  score = 15
+    elif pct <= 20:  score = 13
+    elif pct <= 35:  score = 11
+    elif pct <= 50:  score = 8
+    else:            score = 5
+    if s200_rising is False: score = min(score, 6)
+    return score
+
+def fetch_bhav(date):
+    d=date.strftime("%Y%m%d"); dold=date.strftime("%d%b%Y").upper()
+    yr=date.year; mon=date.strftime("%b").upper()
+    for url in [
+        # Primary — new format
+        f"https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{d}_F_0000.csv.zip",
+        # Legacy format (works for older dates)
+        f"https://www.nseindia.com/content/historical/EQUITIES/{yr}/{mon}/cm{dold}bhav.csv.zip",
+        # Archive mirror
+        f"https://archives.nseindia.com/content/historical/EQUITIES/{yr}/{mon}/cm{dold}bhav.csv.zip",
+        # Direct archive path
+        f"https://nsearchives.nseindia.com/archives/equities/bhavcopy/cm{dold}bhav.csv.zip",
+    ]:
+        try:
+            r=S.get(url,timeout=30)  # increased from 20
+            if r.status_code!=200: continue
+            if len(r.content)<1000: continue  # skip empty responses
+            z=zipfile.ZipFile(io.BytesIO(r.content))
+            df=pd.read_csv(z.open(z.namelist()[0]))
+            df.columns=df.columns.str.strip().str.upper()
+            sc=next((c for c in df.columns if c in["SCTYSRS","SERIES"]),None)
+            if sc: df=df[df[sc].astype(str).str.strip()=="EQ"].copy()
+            rn={}
+            for new,cands in [
+                ("SYMBOL",["TCKRSYMB","SYMBOL"]),
+                ("OPEN",  ["OPNPRIC","OPEN"]),
+                ("HIGH",  ["HGHPRIC","HIGH"]),
+                ("LOW",   ["LWPRIC","LOW"]),
+                ("CLOSE", ["CLSPRIC","CLOSE"]),
+                ("VOLUME",["TTLTRADGVOL","TOTTRDQTY","VOLUME"]),
+                ("VALUE_RS",["TTLTRFVAL","TOTTRDVAL","VALUE"]),
+            ]:
+                if new not in df.columns:
+                    for c in cands:
+                        if c in df.columns: rn[c]=new; break
+            df.rename(columns=rn,inplace=True)
+            if "SYMBOL" not in df.columns: continue
+            for col in["OPEN","HIGH","LOW","CLOSE","VOLUME","VALUE_RS"]:
+                if col in df.columns: df[col]=pd.to_numeric(df[col],errors="coerce")
+            df["DATE"]=date.strftime("%Y-%m-%d")
+            return df
+        except: pass
+    return None
+
+def fetch_full(date):
+    """
+    Read pre-uploaded delivery CSV from data/delivery/{YYYY-MM-DD}.csv
+    in the GitHub repo via Contents API.
+
+    File format (SYMBOL,DELIV_PER — EQ series only, NSE sec_bhavdata_full source):
+        SYMBOL,DELIV_PER
+        RELIANCE,58.23
+        INFY,44.10
+
+    Backfill: bulk_upload_delivery.py (run once locally, 52 days uploaded)
+    Daily top-up: upload_delivery.py (run locally after market close)
+    GitHub Actions reads via PAT_TOKEN — never hits exchange servers.
+    """
+    if not PAT:
+        return None
+    from io import StringIO
+    import base64 as _b64
+    dt_str = date.strftime("%Y-%m-%d")
+    url    = f"https://api.github.com/repos/{GUSER}/{GREPO}/contents/data/delivery/{dt_str}.csv"
+    hdrs   = {"Authorization": f"token {PAT}",
+               "Accept": "application/vnd.github.v3+json"}
+    try:
+        r = requests.get(url, headers=hdrs, timeout=15)
+        if r.status_code != 200:
+            return None
+        content = _b64.b64decode(r.json()["content"]).decode("utf-8")
+        df = pd.read_csv(StringIO(content))
+        df.columns = df.columns.str.strip().str.upper()
+        if "SYMBOL" not in df.columns or "DELIV_PER" not in df.columns:
+            return None
+        df["SYMBOL"]    = df["SYMBOL"].astype(str).str.strip().str.upper()
+        df["DELIV_PER"] = pd.to_numeric(df["DELIV_PER"], errors="coerce")
+        df["CLOSE"]     = np.nan
+        df["DATE"]      = dt_str
+        df = df[df["DELIV_PER"].notna() & df["DELIV_PER"].between(0.01, 100)]
+        return df if len(df) > 100 else None
+    except Exception as e:
+        print(f"    Delivery read err {dt_str}: {e}")
+        return None
+
+def sma(s,n):
+    c=s.dropna()
+    return round(float(c.tail(n).mean()),2) if len(c)>=n else None
+
+def sma_slope(s,n,lookback=20):
+    """Returns True if SMA(n) is rising over last `lookback` days."""
+    c=s.dropna()
+    if len(c)<n+lookback: return None
+    sma_now  = float(c.tail(n).mean())
+    sma_prev = float(c.iloc[-(n+lookback):-lookback].mean())
+    return sma_now > sma_prev  # True=rising, False=falling
+
+def rsi14(s):
+    c=s.dropna()
+    if len(c)<16: return None
+    d=c.diff()
+    g=d.clip(lower=0).rolling(14).mean()
+    l=(-d.clip(upper=0)).rolling(14).mean()
+    v=(100-100/(1+g/l.replace(0,np.nan))).iloc[-1]
+    return round(float(v),1) if pd.notna(v) else None
+
+def cavg(vals):
+    v=[x for x in vals if x is not None and pd.notna(x)]
+    return round(sum(v)/len(v),2) if v else None
+
+
+# ── S1 Filter ─────────────────────────────────────────────────────────────────
+def chk_s1(ltp,mcap,rv,l52,h52,h60,d20,d50,nd,vr,tv,s30,s150,s150_rising):
+    # HARD
+    if mcap is None or not(S1_MCAP_MIN<=mcap<=S1_MCAP_MAX): return False
+    if rv   is None or rv < S1_RSI_MIN:                          return False  # RSI > 40 only
+    if s30  is None or ltp<=s30:                             return False  # Close > 30 DMA
+    if s150 is None or s30<=s150:                            return False  # 30 DMA > 150 DMA
+    if s150_rising is False:                                 return False  # 150 DMA Rising
+    # SOFT
+    if vr  is not None and vr<S1_VOL_RATIO:                  return False
+    if tv  is not None and tv<S1_TV_MIN:                     return False
+    if l52 and l52>0:
+        m=ltp/l52
+        if not(S1_LOW_MIN<=m<=S1_LOW_MAX):                   return False
+    if h60 and ltp<h60*S1_H60:                               return False
+    if nd>=10 and d20 is not None:
+        if d20<S1_DEL_MIN:                                   return False
+    if nd>=20 and d20 is not None and d50 is not None:
+        if (d20-d50)<S1_DEL_GAP:                             return False
+    return True
+
+# ── S2 Filter ─────────────────────────────────────────────────────────────────
+def chk_s2(ltp,mcap,rv,l52,h52,d20,d50,nd,vr,tv,s20,s50,s200,s200_rising):
+    # HARD
+    if mcap is None or mcap<S2_MCAP_MIN:                     return False
+    if rv   is None or rv < S2_RSI_MIN:                      return False
+    if s20  is None or ltp<=s20:                             return False  # Close > 20DMA
+    if s50  is None or ltp<=s50:                             return False  # Close > 50DMA
+    # SOFT
+    if s200 is not None and ltp<=s200:                       return False  # Close > 200DMA
+    if s200_rising is False:                                 return False  # 200DMA Rising
+    if vr  is not None and vr<S2_VOL_RATIO:                  return False
+    if tv  is not None and tv<S2_TV_MIN:                     return False
+    # 52W High proximity filter REMOVED in 18.3 — replaced by 200DMA Distance Score.
+    # Rationale: 52W High measures past peak distance (where price WAS),
+    # not trend quality (where price IS relative to institutional benchmark).
+    if nd>=10 and d20 is not None:
+        if d20<S2_DEL_MIN:                                   return False
+    return True
+
+# ── Scoring ───────────────────────────────────────────────────────────────────
+def sc_s1(d20,d50,vr,rv,fp,tv):
+    s=0.0
+    if d20 and d20>=40: s+=min((d20-40)/40*25,25)
+    if d20 and d50 and(d20-d50)>2: s+=min((d20-d50-2)/13*20,20)
+    if vr  and vr>=1.1: s+=min((vr-1.1)/0.9*20,20)
+    if rv:  s+=max(0,20-abs(rv-55)*0.8)
+    if fp:
+        if 10<=fp<=35:  s+=15
+        elif 5<=fp<10:  s+=10
+        elif 35<fp<=45: s+=8
+    if tv and tv>=5: s+=min((tv-5)/45*10,10)
+    return min(int(round(s)),100)
+
+def sc_s2(d20,d50,vr,rv,ltp,s20,s50,s200,tv,s200_rising=None):
+    """
+    S2 score (0-100). 18.5 change: 200DMA Distance Score replaces old ma×5.
+    Old: sum(above 20/50/200 DMA) × 5 = binary 0/5/10/15
+    New: dma200_score() = stepped 0/5/8/11/13/15 based on % above 200DMA
+    Rationale: graduated distance rewards correct risk/reward entry zones.
+    """
+    s=0.0
+    if d20 and d20>=40: s+=min((d20-40)/40*25,25)
+    if d20 and d50 and(d20-d50)>2: s+=min((d20-d50-2)/13*20,20)
+    if vr  and vr>=1.1: s+=min((vr-1.1)/0.9*20,20)
+    if rv:  s+=max(0,20-abs(rv-55)*0.8)
+    s+=dma200_score(ltp,s200,s200_rising)   # 0-15 pts (200DMA distance)
+    if tv and tv>=25: s+=min((tv-25)/75*10,10)
+    return min(int(round(s)),100)
+
+# ── Grading ───────────────────────────────────────────────────────────────────
+def grade(sc,st,d20,d50,vr,fp,nd,ltp,s20,s50,s200,h60):
+    gap   = (d20-d50) if d20 and d50 else 0
+    dok   = nd>=10 and d20 is not None
+    close_to_h60 = h60 and ltp >= h60*0.90 if st=="s1" else True
+
+    if st=="s1":
+        # S1 GRADING — UNCHANGED from 18.2
+        if dok:
+            if (sc>=82 and d20>=60 and gap>=8 and vr and vr>=1.5
+                    and fp and 10<=fp<=35 and close_to_h60):       return "A+"
+            if (sc>=68 and d20>=52 and gap>=3 and vr and vr>=1.35
+                    and fp and fp<=35):                             return "A"
+        else:
+            if sc>=82 and vr and vr>=1.5  and fp and 10<=fp<=35:  return "A+"
+            if sc>=68 and vr and vr>=1.35 and fp and fp<=35:      return "A"
+        if sc>=52: return "B+"
+        if sc>=38: return "B"
+    else:
+        # S2 GRADING — 18.5 calibration
+        # Two paths to A/A+ reflecting two types of institutional signal:
+        #   Path A: acceleration signal (d20 accelerating well above d50)
+        #   Path B: quality signal (sustained high delivery, not declining)
+        # Rationale: Large caps accumulate over months via block deals / algo slicing.
+        # Daily delivery gap rarely exceeds 4-6%. But sustained 58%+ delivery
+        # IS an institutional ownership signal even if gap is small.
+        path_a_aplus = (dok and d20>=S2_APLUS_DEL_A and gap>=S2_APLUS_GAP_A)
+        path_b_aplus = (dok and d20>=S2_APLUS_DEL_B and gap>=S2_APLUS_GAP_B)
+
+        path_a_a     = (dok and d20>=S2_A_DEL and gap>=S2_A_GAP)
+        path_b_a     = (dok and d20>=S2_APLUS_DEL_B and gap>=S2_APLUS_GAP_B)
+
+        if dok:
+            if (sc>=S2_APLUS_SCORE and vr and vr>=S2_APLUS_VOL
+                    and (path_a_aplus or path_b_aplus)):            return "A+"
+            if (sc>=S2_A_SCORE and vr and vr>=S2_A_VOL
+                    and (path_a_a or path_b_a)):                    return "A"
+        else:
+            # No delivery data: score + volume only (delivery conditions relaxed)
+            if sc>=S2_APLUS_SCORE and vr and vr>=S2_APLUS_VOL:     return "A+"
+            if sc>=S2_A_SCORE     and vr and vr>=S2_A_VOL:         return "A"
+        if sc>=52: return "B+"
+        if sc>=38: return "B"
+    return "C"
+
+# ── Confidence Score ──────────────────────────────────────────────────────────
+def conf(d20,d50,dlat,vr,rv,fp,sc,gr,dvals,ltp,s20,s30,s50,s150,s200,st,
+         s150_rising,s200_rising=None):
+    sig={}
+
+    # Delivery Quality (0-20)
+    dq=0
+    if dvals and len(dvals)>=3:
+        thr=50 if st=="s1" else 45
+        dq=min(sum(1 for x in dvals if x>=thr)/len(dvals)*20,20)
+        if dlat and d20 and dlat>d20: dq=min(dq+3,20)
+    elif d20 and d20>=40: dq=10
+    sig["delivery_quality"]=round(dq,1)
+
+    # Delivery Trend (0-15)
+    dt=0
+    if d20 and d50 and d20>d50:
+        dt=min((d20-d50)/10*15,15)
+    sig["delivery_trend"]=round(dt,1)
+
+    # Volume Expansion (0-20)
+    vc=(20 if vr and vr>=2.0 else 16 if vr and vr>=1.75 else 12 if vr and vr>=1.5
+        else 8 if vr and vr>=1.3 else 5 if vr and vr>=1.1 else 0)
+    sig["volume_expansion"]=round(vc,1)
+
+    # RSI Zone (0-15)
+    # Ideal zone 50-62 scores highest
+    # Extended zone 70-80 scores lower but still valid
+    # Blow-off zone >80 penalised — caution signal
+    if rv is None:
+        rq = 0
+    elif 50 <= rv <= 62:   rq = 15   # Ideal institutional accumulation zone
+    elif 45 <= rv < 50:    rq = 12   # Slightly below ideal — building momentum
+    elif 62 < rv <= 70:    rq = 12   # Slightly above ideal — healthy momentum
+    elif 40 <= rv < 45:    rq = 8    # Low end — early stage, watch closely
+    elif 70 < rv <= 80:    rq = 8    # Extended — valid breakout zone, lower confidence
+    elif 80 < rv <= 85:    rq = 3    # Caution — blow-off risk increasing
+    else:                  rq = 0    # RSI > 85 — extreme extension, no RSI score
+    sig["rsi_zone"]=round(rq,1)
+
+    # Price Position (0-15)
+    # S1: distance from 52W Low (UNCHANGED)
+    # S2: 200DMA Distance Score — 18.5 (replaces old 3×5 SMA binary check)
+    rr=0
+    if st=="s1" and fp:
+        if 10<=fp<=35:  rr=15
+        elif 5<=fp<10:  rr=11
+        elif 35<fp<=45: rr=8
+    elif st=="s2":
+        rr=dma200_score(ltp,s200,s200_rising)
+    sig["price_position"]=round(rr,1)
+
+    # Trend Alignment (0-10)
+    ta=0
+    if st=="s1":
+        if ltp and s30 and s150 and ltp>s30 and s30>s150: ta=10
+        elif ltp and s30 and ltp>s30: ta=5
+    else:
+        if ltp and s20 and s50 and s200 and ltp>s20 and s20>s50 and s50>s200: ta=10
+        elif ltp and s20 and s50 and ltp>s20 and s20>s50: ta=7
+        elif ltp and s20 and ltp>s20: ta=4
+    sig["trend_alignment"]=round(ta,1)
+
+    # Grade Bonus (0-5)
+    gb={"A+":5,"A":4,"B+":3,"B":1}.get(gr,0)
+    sig["grade_bonus"]=gb
+
+    total=dq+dt+vc+rq+rr+ta+gb
+
+    # Institutional Bonus (+5) — ranking only
+    inst_bonus=0
+    if st=="s1":
+        if (ltp and s30 and s150 and ltp>s30 and s30>s150
+                and vr and vr>1.5
+                and d20 and d50 and (d20-d50)>5):
+            inst_bonus=5
+    else:
+        if (ltp and s20 and s50 and s200
+                and ltp>s20 and s20>s50 and s50>s200
+                and vr and vr>1.5
+                and d20 and d50 and (d20-d50)>5):
+            inst_bonus=5
+    sig["institutional_bonus"]=inst_bonus
+    total+=inst_bonus
+
+    total=min(int(round(total)),100)
+    lbl=("VERY HIGH" if total>=85 else "HIGH" if total>=70
+         else "MODERATE" if total>=55 else "LOW" if total>=40 else "VERY LOW")
+    return total,sig,lbl
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+print("="*60)
+print("MATRIX 18.5 — INSTITUTIONAL ACCUMULATION SCREENER")
+print(f"Started : {datetime.now():%Y-%m-%d %H:%M:%S}")
+print(f"PAT     : {'SET' if PAT else 'NOT SET'}")
+print(f"MCap    : SHARES_MAP ({len(SHARES_MAP)} stocks)")
+print("="*60)
+print("S1 HARD: MCap 1500-30K | RSI >40 | Close>30DMA | 30DMA>150DMA | 150DMA↑")
+print("S2 HARD: MCap >30K | RSI >40 | Close>20DMA | Close>50DMA")
+print("S2 18.5: 200DMA Distance Score | Dual delivery paths | Vol A+≥1.35x A≥1.20x")
+print("RSI bands UNCHANGED — timing layer preserved")
+
+# ── Phase 1: BhavCopy 260 days ────────────────────────────────────────────────
+all_dates=trdates(DAYS_BHAV)
+print(f"\nPhase 1: {len(all_dates)} days BhavCopy...")
+bhav_frames={}
+def _b(d): return d,fetch_bhav(d)
+with ThreadPoolExecutor(max_workers=10) as ex:
+    futs={ex.submit(_b,d):d for d in all_dates}
+    done=0
+    for fut in as_completed(futs):
+        dt,df=fut.result()
+        if df is None: continue
+        bhav_frames[dt.strftime("%Y-%m-%d")]=df
+        done+=1
+        if done%50==0: print(f"  {done}/{len(all_dates)}")
+print(f"  Loaded: {len(bhav_frames)} days")
+
+# ── Phase 2: Delivery data — read from data/delivery/ in this repo ────────────
+# 52 days pre-loaded via bulk_upload_delivery.py
+# Daily top-up via upload_delivery.py (run locally after market close)
+full_dates=trdates(DAYS_FULL)
+print(f"\nPhase 2: {len(full_dates)} days delivery (reading from repo)...")
+full_frames={}
+def _f(d): return d,fetch_full(d)
+with ThreadPoolExecutor(max_workers=10) as ex:
+    futs={ex.submit(_f,d):d for d in full_dates}
+    for fut in as_completed(futs):
+        dt,df=fut.result()
+        if df is None: continue
+        full_frames[dt.strftime("%Y-%m-%d")]=df
+del_days=len(full_frames)
+print(f"  Loaded: {del_days} days from repo")
+if full_frames:
+    s=sorted(full_frames.keys())[-1]
+    df_s=full_frames[s]
+    if "DELIV_PER" in df_s.columns:
+        ok=(df_s["DELIV_PER"]>0).sum()
+        print(f"  Latest ({s}): {ok} stocks with delivery")
+
+# ── Build DataFrame ───────────────────────────────────────────────────────────
+all_df=pd.concat(list(bhav_frames.values()),ignore_index=True)
+for col in["OPEN","HIGH","LOW","CLOSE","VOLUME","VALUE_RS"]:
+    if col in all_df.columns: all_df[col]=pd.to_numeric(all_df[col],errors="coerce")
+all_df["DATE"]=pd.to_datetime(all_df["DATE"])
+all_df["SYMBOL"]=all_df["SYMBOL"].astype(str).str.strip().str.upper()
+all_df.sort_values(["SYMBOL","DATE"],inplace=True)
+all_df.drop_duplicates(subset=["SYMBOL","DATE"],keep="last",inplace=True)
+
+if full_frames:
+    full_df=pd.concat(list(full_frames.values()),ignore_index=True)
+    full_df["SYMBOL"]=full_df["SYMBOL"].astype(str).str.strip().str.upper()
+    full_df["DATE"]=pd.to_datetime(full_df["DATE"])
+    if "DELIV_PER" in full_df.columns:
+        full_df["DELIV_PER"]=pd.to_numeric(full_df["DELIV_PER"],errors="coerce")
+    del_merge=full_df[["SYMBOL","DATE","DELIV_PER"]].copy()
+    all_df=all_df.merge(del_merge,on=["SYMBOL","DATE"],how="left")
+
+symbols = list(set(all_df["SYMBOL"].unique()) & set(SHARES_MAP.keys()))
+
+print(f"\n{'='*50}")
+print(f"BhavCopy  : {len(bhav_frames)} days")
+print(f"Delivery  : {del_days} days")
+print(f"Screening : {len(symbols)} stocks")
+
+# Need at least 160 days for SMA150 to work
+if len(bhav_frames) < 160:
+    print(f"\n⚠ INSUFFICIENT DATA: only {len(bhav_frames)} BhavCopy days loaded.")
+    print(f"  Need 160+ days for SMA150. Filters will produce 0 results.")
+    print(f"  Possible causes:")
+    print(f"  1. NSE archive URL changed — check fetch_bhav() URLs")
+    print(f"  2. GitHub Actions IP being rate-limited by NSE")
+    print(f"  3. Scan running outside market hours when archives not updated")
+    out={"stocks":[],"count":0,"fetchedAt":datetime.now().isoformat(),
+         "autoRun":True,"error":f"Insufficient BhavCopy data: {len(bhav_frames)} days (need 160+)"}
+    push_github(json.dumps(out)); exit(1)
+
+if len(symbols)<10:
+    out={"stocks":[],"count":0,"fetchedAt":datetime.now().isoformat(),"autoRun":True}
+    push_github(json.dumps(out)); exit(0)
+
+# ── Screening loop ────────────────────────────────────────────────────────────
+results=[]; s1n=s2n=proc=0
+sk={k:0 for k in["rows","close","mcap","s1","s2","gc"]}
+
+for sym in symbols:
+    try:
+        sdf=all_df[all_df["SYMBOL"]==sym].copy()
+        proc+=1
+        if proc%500==0: print(f"  {proc}/{len(symbols)} res={len(results)} s1={s1n} s2={s2n}")
+
+        if len(sdf)<20: sk["rows"]+=1; continue
+        closes=sdf["CLOSE"].dropna()
+        if len(closes)<20: sk["close"]+=1; continue
+        ltp=round(float(closes.iloc[-1]),2)
+        if ltp<=0: sk["close"]+=1; continue
+
+        shares_cr=SHARES_MAP.get(sym)
+        if shares_cr is None: sk["mcap"]+=1; continue
+        mcap=round(ltp*shares_cr,2)
+
+        chg=round((ltp-float(closes.iloc[-2]))/float(closes.iloc[-2])*100,2) if len(closes)>=2 else 0.0
+
+        # 52W
+        h52=round(float(sdf["HIGH"].dropna().max()),2) if "HIGH" in sdf.columns else ltp
+        l52=round(float(sdf["LOW"].dropna().min()),2)  if "LOW"  in sdf.columns else ltp
+        fp =round((ltp-l52)/l52*100,2) if l52>0 else None
+        fh =round((h52-ltp)/h52*100,2) if h52>0 else None
+        h60=round(float(closes.tail(60).max()),2)
+
+        # Volume
+        vols=sdf["VOLUME"].dropna() if "VOLUME" in sdf.columns else pd.Series(dtype=float)
+        vol_td=int(vols.iloc[-1]) if len(vols)>0 else 0
+        v20=float(vols.tail(20).mean()) if len(vols)>=20 else None
+        v50=float(vols.tail(50).mean()) if len(vols)>=50 else None
+        vr =round(v20/v50,3) if v20 and v50 and v50>0 else None
+
+        # Traded value
+        tv=None
+        if "VALUE_RS" in sdf.columns:
+            tvs=sdf["VALUE_RS"].dropna()
+            if len(tvs)>=5: tv=round(float(tvs.tail(20).mean())/1e7,2)
+
+        # SMAs
+        s20 =sma(closes,20)
+        s30 =sma(closes,30)  if len(closes)>=30  else None
+        s50 =sma(closes,50)  if len(closes)>=50  else None
+        s150=sma(closes,150) if len(closes)>=150 else None
+        s200=sma(closes,200) if len(closes)>=200 else None
+        rv  =rsi14(closes)
+
+        # DMA slope checks
+        s150_rising = sma_slope(closes,150,lookback=20)  # None if insufficient data
+        s200_rising = sma_slope(closes,200,lookback=20)
+
+        # Delivery
+        dvals=[]
+        if "DELIV_PER" in sdf.columns:
+            dp=pd.to_numeric(sdf["DELIV_PER"],errors="coerce")
+            dvals=[float(x) for x in dp if pd.notna(x) and 0<x<=100]
+        nd  =len(dvals)
+        d20 =cavg(dvals[-20:]) if nd>=1  else None
+        d50 =cavg(dvals[-50:]) if nd>=20 else None
+        dlat=dvals[-1] if dvals else None
+
+        # Strategy
+        st=None
+        if chk_s1(ltp,mcap,rv,l52,h52,h60,d20,d50,nd,vr,tv,s30,s150,s150_rising):
+            st="s1"
+        elif chk_s2(ltp,mcap,rv,l52,h52,d20,d50,nd,vr,tv,s20,s50,s200,s200_rising):
+            st="s2"
+
+        if st is None:
+            if mcap<=S1_MCAP_MAX: sk["s1"]+=1
+            else: sk["s2"]+=1
+            continue
+
+        score = sc_s1(d20,d50,vr,rv,fp,tv) if st=="s1" \
+                else sc_s2(d20,d50,vr,rv,ltp,s20,s50,s200,tv,s200_rising)
+        gr    = grade(score,st,d20,d50,vr,fp,nd,ltp,s20,s50,s200,h60)
+        if gr=="C": sk["gc"]+=1; continue
+
+        cf,sigs,lbl = conf(d20,d50,dlat,vr,rv,fp,score,gr,dvals[-20:],
+                           ltp,s20,s30,s50,s150,s200,st,s150_rising,s200_rising)
+        if st=="s1": s1n+=1
+        else: s2n+=1
+
+        results.append({
+            "symbol":sym,"strategy":st,
+            "strategyLabel":"Mid/Small Cap" if st=="s1" else "Large/Mega Cap",
+            "ltp":ltp,"change":chg,
+            "high52w":h52,"low52w":l52,"fromLow":fp,"fromHigh":fh,
+            "volume":vol_td,"mcap":round(mcap),"tradedValueCr":tv,
+            "rsi":rv,
+            "sma20":s20,"sma30":s30,"sma50":s50,"sma150":s150,"sma200":s200,
+            "sma150Rising":s150_rising,"sma200Rising":s200_rising,
+            "volRatio":vr,
+            "avgDelivery":d20,"avgDelivery50":d50,
+            "deliveryTrend":round(d20-d50,2) if d20 and d50 else None,
+            "deliveryToday":dlat,"deliveryDays":nd,
+            "score":score,"grade":gr,"daysOfData":len(sdf),
+            "confidence":cf,"confidenceLabel":lbl,"confidenceBreakdown":sigs,
+        })
+    except Exception as e:
+        print(f"  ERR {sym}: {e}")
+
+print(f"\nResults : {len(results)} (S1:{s1n} S2:{s2n})")
+print(f"Skipped : rows={sk['rows']} close={sk['close']} mcap={sk['mcap']} s1={sk['s1']} s2={sk['s2']} gc={sk['gc']}")
+results.sort(key=lambda x:x["confidence"] or 0,reverse=True)
+
+payload={
+    "stocks":results,"count":len(results),
+    "s1Count":s1n,"s2Count":s2n,
+    "fetchedAt":datetime.now().isoformat(),"autoRun":True,
+    "daysOfData":len(bhav_frames),
+    "screenerVersion":"18.5",
+    "dataAvailability":{
+        "mcap":True,"delivery":del_days>0,
+        "deliveryDays":del_days,"sma200":len(bhav_frames)>=200,
+    },
+}
+content=json.dumps(payload)
+os.makedirs("results",exist_ok=True)
+with open("results/matrix181_results.json","w") as f: f.write(content)
+sz=os.path.getsize("results/matrix181_results.json")
+print(f"Saved : {sz:,} bytes")
+print(f"API   : {'OK' if push_github(content) else 'FAIL'}")
+print("="*60)
+print(f"MATRIX 18.5 DONE — {len(results)} stocks | S1:{s1n} S2:{s2n}")
+print(f"A+:{sum(1 for r in results if r['grade']=='A+')} "
+      f"A:{sum(1 for r in results if r['grade']=='A')} "
+      f"B+:{sum(1 for r in results if r['grade']=='B+')} "
+      f"B:{sum(1 for r in results if r['grade']=='B')}")
+print("="*60)
