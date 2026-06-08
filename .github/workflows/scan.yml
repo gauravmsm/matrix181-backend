@@ -1,0 +1,40 @@
+name: Matrix 18.1 Daily Scan
+
+on:
+  schedule:
+    - cron: '15 14 * * 1-5'   # 7:45 PM IST = 14:15 UTC, Mon-Fri (main scan)
+    - cron: '0 10 * * 0'      # Sunday 3:30 PM IST = keepalive ping only
+  workflow_dispatch:            # manual trigger anytime from Actions tab
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests pandas numpy
+
+      - name: Run Matrix 18.5 scan
+        if: github.event.schedule != '0 10 * * 0'
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: python scan.py
+
+      - name: Upload results via GitHub API
+        if: github.event.schedule != '0 10 * * 0'
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: python scripts/upload_results.py
+
+      - name: Keep workflow alive (Sunday ping)
+        if: github.event.schedule == '0 10 * * 0'
+        run: |
+          echo "Keepalive ping — $(date)"
+          echo "Schedule is active. Next scan: Monday 7:45 PM IST"
