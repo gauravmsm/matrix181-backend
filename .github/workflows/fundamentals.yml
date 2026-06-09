@@ -1,0 +1,36 @@
+name: Weekly Fundamentals Fetch
+
+on:
+  schedule:
+    - cron: '30 2 * * 0'   # Sunday 2:30 AM UTC = 8:00 AM IST
+  workflow_dispatch:         # Manual trigger from GitHub Actions tab
+
+jobs:
+  fetch-fundamentals:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests pandas
+
+      - name: Run fundamentals fetcher
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: python scripts/fundamentals_fetch.py
+
+      - name: Commit and push fundamentals.json
+        run: |
+          git config user.name  "MATRIX Bot"
+          git config user.email "matrix@gauravmsm"
+          git add data/fundamentals.json
+          git diff --staged --quiet || git commit -m "fundamentals update $(date +%Y-%m-%d)"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
