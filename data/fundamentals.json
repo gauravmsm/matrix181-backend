@@ -1,7 +1,7 @@
 {
   "GLAND": {
     "symbol": "GLAND",
-    "updatedAt": "2026-06-09",
+    "updatedAt": "2026-06-10",
     "governanceType": "MNC",
     "companyName": "Gland Pharma Limited",
     "sector": "Healthcare",
@@ -25,7 +25,7 @@
   },
   "JSFB": {
     "symbol": "JSFB",
-    "updatedAt": "2026-06-09",
+    "updatedAt": "2026-06-10",
     "governanceType": "PRIVATE",
     "companyName": "Jana Small Finance Bank Limited",
     "sector": "Financial Services",
@@ -46,7 +46,7 @@
   },
   "NH": {
     "symbol": "NH",
-    "updatedAt": "2026-06-09",
+    "updatedAt": "2026-06-10",
     "governanceType": "PRIVATE",
     "companyName": "Narayana Hrudayalaya Limited",
     "sector": "Healthcare",
@@ -70,7 +70,7 @@
   },
   "ANTHEM": {
     "symbol": "ANTHEM",
-    "updatedAt": "2026-06-09",
+    "updatedAt": "2026-06-10",
     "governanceType": "PRIVATE",
     "companyName": "ANTHEM BIOSCIENCES LTD",
     "sector": "Healthcare",
@@ -94,7 +94,7 @@
   },
   "DIVISLAB": {
     "symbol": "DIVISLAB",
-    "updatedAt": "2026-06-09",
+    "updatedAt": "2026-06-10",
     "governanceType": "PRIVATE",
     "companyName": "Divi's Laboratories Limited",
     "sector": "Healthcare",
@@ -118,7 +118,7 @@
   },
   "AIAENG": {
     "symbol": "AIAENG",
-    "updatedAt": "2026-06-09",
+    "updatedAt": "2026-06-10",
     "governanceType": "GROUP",
     "companyName": "AIA Engineering Limited",
     "sector": "Industrials",
@@ -142,7 +142,7 @@
   },
   "COALINDIA": {
     "symbol": "COALINDIA",
-    "updatedAt": "2026-06-09",
+    "updatedAt": "2026-06-10",
     "governanceType": "PSU",
     "companyName": "Coal India Limited",
     "sector": "Energy",
@@ -166,7 +166,7 @@
   },
   "TORNTPHARM": {
     "symbol": "TORNTPHARM",
-    "updatedAt": "2026-06-09",
+    "updatedAt": "2026-06-10",
     "governanceType": "GROUP",
     "companyName": "Torrent Pharmaceuticals Limited",
     "sector": "Healthcare",
@@ -190,7 +190,7 @@
   },
   "GMRAIRPORT": {
     "symbol": "GMRAIRPORT",
-    "updatedAt": "2026-06-09",
+    "updatedAt": "2026-06-10",
     "governanceType": "GROUP",
     "companyName": "GMR Airports Limited",
     "sector": "Industrials",
@@ -211,7 +211,7 @@
   },
   "IPCALAB": {
     "symbol": "IPCALAB",
-    "updatedAt": "2026-06-09",
+    "updatedAt": "2026-06-10",
     "governanceType": "GROUP",
     "companyName": "Ipca Laboratories Limited",
     "sector": "Healthcare",
@@ -235,7 +235,7 @@
   },
   "ZYDUSLIFE": {
     "symbol": "ZYDUSLIFE",
-    "updatedAt": "2026-06-09",
+    "updatedAt": "2026-06-10",
     "governanceType": "GROUP",
     "companyName": "Zydus Lifesciences Limited",
     "sector": "Healthcare",
@@ -259,7 +259,7 @@
   },
   "ENRIN": {
     "symbol": "ENRIN",
-    "updatedAt": "2026-06-09",
+    "updatedAt": "2026-06-10",
     "governanceType": "PRIVATE",
     "companyName": "Siemens Energy India Limited",
     "sector": "Utilities",
@@ -281,7 +281,7 @@
   },
   "INDIANB": {
     "symbol": "INDIANB",
-    "updatedAt": "2026-06-09",
+    "updatedAt": "2026-06-10",
     "governanceType": "PSU",
     "companyName": "Indian Bank",
     "sector": "Financial Services",
@@ -302,7 +302,7 @@
   },
   "TIINDIA": {
     "symbol": "TIINDIA",
-    "updatedAt": "2026-06-09",
+    "updatedAt": "2026-06-10",
     "governanceType": "GROUP",
     "companyName": "Tube Investments of India Limited",
     "sector": "Industrials",
@@ -322,7 +322,7 @@
   },
   "FEDERALBNK": {
     "symbol": "FEDERALBNK",
-    "updatedAt": "2026-06-09",
+    "updatedAt": "2026-06-10",
     "governanceType": "PRIVATE",
     "companyName": "The Federal Bank Limited",
     "sector": "Financial Services",
@@ -343,7 +343,7 @@
   },
   "SOLARINDS": {
     "symbol": "SOLARINDS",
-    "updatedAt": "2026-06-09",
+    "updatedAt": "2026-06-10",
     "governanceType": "PRIVATE",
     "companyName": "Solar Industries India Limited",
     "sector": "Basic Materials",
@@ -367,9 +367,9 @@
   },
   "GVT&D": {
     "symbol": "GVT&D",
-    "updatedAt": "2026-06-09",
+    "updatedAt": "2026-06-10",
     "governanceType": "PRIVATE",
-    "companyName": "GE Vernova T&D India Limited",
+    "companyName": "GE Vernova T&D India Ltd",
     "sector": "Industrials",
     "industry": "Specialty Industrial Machinery",
     "pe": 101.90122,
@@ -391,7 +391,7 @@
   },
   "TATACOMM": {
     "symbol": "TATACOMM",
-    "updatedAt": "2026-06-09",
+    "updatedAt": "2026-06-10",
     "governanceType": "GROUP",
     "companyName": "Tata Communications Limited",
     "sector": "Communication Services",
@@ -411,6 +411,30 @@
     "epsGrowthYoY": -74.7,
     "revenueGrowthYoY": 9.4,
     "cfoPatRatio": 4.29,
+    "fetchSource": "yfinance"
+  },
+  "WELSPUNLIV": {
+    "companyName": "Welspun Living Limited",
+    "sector": "Consumer Cyclical",
+    "industry": "Textile Manufacturing",
+    "pe": 66.560745,
+    "pb": 2.9466891,
+    "roe": 4.3,
+    "roce": 2.4,
+    "operatingMargin": 6.0,
+    "netMargin": 2.17,
+    "grossMargin": 46.24,
+    "debtEquity": 0.465,
+    "currentRatio": 1.584,
+    "quickRatio": 0.718,
+    "promoterPct": 68.82,
+    "institutionalPct": 14.72,
+    "epsGrowthYoY": -21.3,
+    "revenueGrowthYoY": -8.0,
+    "cfoPatRatio": 5.75,
+    "symbol": "WELSPUNLIV",
+    "governanceType": "PRIVATE",
+    "updatedAt": "2026-06-10",
     "fetchSource": "yfinance"
   }
 }
