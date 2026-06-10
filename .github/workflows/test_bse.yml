@@ -1,0 +1,27 @@
+name: BSE API Test
+
+on:
+  workflow_dispatch:   # Manual trigger only
+
+jobs:
+  test-bse:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run BSE API test
+        run: python scripts/test_bse.py
+
+      # The output in Actions logs will show exactly which endpoints work
+      # from GitHub Actions server IPs
