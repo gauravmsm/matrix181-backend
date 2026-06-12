@@ -1,0 +1,26 @@
+name: Patch Matrix182 JSX
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout backend repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Push patched JSX via GitHub API
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: python3 scripts/push_jsx_via_api.py
