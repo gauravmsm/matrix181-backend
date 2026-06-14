@@ -15370,5 +15370,10 @@
     "institutionalPct": 0.03,
     "updatedAt": "2026-06-14",
     "fetchSource": "yfinance_v5"
+  },
+  "ENRIN": {
+    "symbol": "ENRIN",
+    "skipReason": "delisted_or_otc",
+    "updatedAt": "2026-06-14"
   }
 }
