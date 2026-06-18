@@ -48938,5 +48938,25 @@
     "name": "Zydus Lifesciences Limited",
     "updated": "2026-06-18",
     "source": "yfinance"
+  },
+  "ZYDUSWELL": {
+    "pe": 81.91,
+    "pb": 2.82,
+    "roe": 3.43,
+    "roce": 2.65,
+    "de": 54.97,
+    "mcap": 16105.12,
+    "revenue": 3961.0,
+    "profit": 197.2,
+    "eps": 6.18,
+    "div_yield": 0,
+    "52w_high": 552.4,
+    "52w_low": 367.55,
+    "beta": -0.07,
+    "sector": "Consumer Defensive",
+    "industry": "Packaged Foods",
+    "name": "Zydus Wellness Limited",
+    "updated": "2026-06-18",
+    "source": "yfinance"
   }
 }
