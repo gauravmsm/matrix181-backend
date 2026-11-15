@@ -48438,5 +48438,25 @@
     "name": "Zydus Wellness Limited",
     "updated": "2026-11-11",
     "source": "yfinance"
+  },
+  "PSUBNKIETF": {
+    "pe": 0,
+    "pb": 0,
+    "roe": 0,
+    "roce": 0,
+    "de": 0,
+    "mcap": 0.0,
+    "revenue": 0.0,
+    "profit": 0.0,
+    "eps": 0,
+    "div_yield": 0,
+    "52w_high": 104.0,
+    "52w_low": 79.35,
+    "beta": 0,
+    "sector": "",
+    "industry": "",
+    "name": "",
+    "updated": "2026-11-15",
+    "source": "yfinance"
   }
 }
