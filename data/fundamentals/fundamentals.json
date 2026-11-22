@@ -34000,15 +34000,15 @@
     "source": "yfinance"
   },
   "POWERINDIA": {
-    "pe": 112.76,
-    "pb": 25.06,
-    "roe": 0,
-    "roce": 0,
-    "de": 1.66,
-    "mcap": 129705.57,
-    "revenue": 9162.5,
-    "profit": 1150.39,
-    "eps": 258.08,
+    "pe": 111.57,
+    "pb": 23.35,
+    "roe": 23.3,
+    "roce": 8.18,
+    "de": 1.45,
+    "mcap": 134385.68,
+    "revenue": 10326.46,
+    "profit": 1204.52,
+    "eps": 270.23,
     "div_yield": 3.0,
     "52w_high": 38785.0,
     "52w_low": 16111.0,
@@ -34016,7 +34016,7 @@
     "sector": "Industrials",
     "industry": "Electrical Equipment & Parts",
     "name": "Hitachi Energy India Limited",
-    "updated": "2026-11-11",
+    "updated": "2026-11-22",
     "source": "yfinance"
   },
   "POWERMECH": {
@@ -48456,7 +48456,7 @@
     "sector": "",
     "industry": "",
     "name": "",
-    "updated": "2026-11-15",
+    "updated": "2026-11-22",
     "source": "yfinance"
   }
 }
